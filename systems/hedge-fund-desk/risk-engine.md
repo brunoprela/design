@@ -104,6 +104,104 @@ The factor decomposition uses five style factors (market beta, size, value, mome
 
 Every risk metric is computed at the position level first, then aggregated to the portfolio level. This allows PMs to see which positions contribute most to total VaR (component VaR) and which stress scenarios hurt which holdings.
 
+### Pluggable Risk Calculators Per Asset Class
+
+Different asset classes contribute to portfolio risk differently. Equities are priced by market moves, bonds by yield curve shifts, options by Greeks (delta, gamma, vega), futures by underlying moves scaled by contract size. The risk engine uses a `RiskCalculator` protocol that asset-class-specific implementations satisfy:
+
+```python
+# calculators/protocol.py
+
+from typing import Protocol
+from decimal import Decimal
+import numpy as np
+
+
+class RiskCalculator(Protocol):
+    """Asset-class-specific risk calculation logic."""
+
+    def position_return(
+        self, position: dict, scenario_return: Decimal, **kwargs,
+    ) -> Decimal:
+        """Estimate the position's P&L under a given market scenario."""
+        ...
+
+    def factor_sensitivity(
+        self, position: dict, factor: str, **kwargs,
+    ) -> Decimal:
+        """Sensitivity of this position to a given risk factor."""
+        ...
+
+
+class EquityRiskCalculator:
+    """Equities: P&L = quantity × price × return."""
+
+    def position_return(self, position: dict, scenario_return: Decimal, **kwargs) -> Decimal:
+        return Decimal(str(position["market_value"])) * scenario_return
+
+    def factor_sensitivity(self, position: dict, factor: str, **kwargs) -> Decimal:
+        betas = position.get("factor_betas", {})
+        return Decimal(str(betas.get(factor, 0)))
+
+
+class FixedIncomeRiskCalculator:
+    """Bonds: P&L approximated by duration × yield change + convexity adjustment."""
+
+    def position_return(self, position: dict, scenario_return: Decimal, **kwargs) -> Decimal:
+        duration = Decimal(str(position.get("duration", 5)))
+        convexity = Decimal(str(position.get("convexity", 50)))
+        yield_change = kwargs.get("yield_change", scenario_return)
+        mv = Decimal(str(position["market_value"]))
+        # First-order: -D × Δy, second-order: +0.5 × C × Δy²
+        return mv * (-duration * yield_change + Decimal("0.5") * convexity * yield_change ** 2)
+
+    def factor_sensitivity(self, position: dict, factor: str, **kwargs) -> Decimal:
+        if factor == "interest_rate":
+            return -Decimal(str(position.get("duration", 5)))
+        if factor == "credit_spread":
+            return -Decimal(str(position.get("spread_duration", 3)))
+        return Decimal("0")
+
+
+class OptionRiskCalculator:
+    """Options: P&L from delta + gamma + vega effects."""
+
+    def position_return(self, position: dict, scenario_return: Decimal, **kwargs) -> Decimal:
+        delta = Decimal(str(position.get("delta", 0)))
+        gamma = Decimal(str(position.get("gamma", 0)))
+        vega = Decimal(str(position.get("vega", 0)))
+        multiplier = Decimal(str(position.get("contract_multiplier", 100)))
+        qty = Decimal(str(position.get("quantity", 0)))
+        underlying_price = Decimal(str(position.get("underlying_price", 0)))
+        vol_change = kwargs.get("vol_change", Decimal("0"))
+
+        price_move = underlying_price * scenario_return
+        # Taylor expansion: delta × ΔS + 0.5 × gamma × ΔS² + vega × Δσ
+        pnl_per_contract = (
+            delta * price_move
+            + Decimal("0.5") * gamma * price_move ** 2
+            + vega * vol_change
+        )
+        return qty * multiplier * pnl_per_contract
+
+    def factor_sensitivity(self, position: dict, factor: str, **kwargs) -> Decimal:
+        if factor == "market_beta":
+            return Decimal(str(position.get("delta", 0)))
+        if factor == "volatility":
+            return Decimal(str(position.get("vega", 0)))
+        return Decimal("0")
+
+
+RISK_CALCULATORS: dict[str, RiskCalculator] = {
+    "equity": EquityRiskCalculator(),
+    "etf": EquityRiskCalculator(),
+    "fixed_income": FixedIncomeRiskCalculator(),
+    "option": OptionRiskCalculator(),
+    "future": EquityRiskCalculator(),  # linear like equities, scaled by contract size
+}
+```
+
+The risk orchestrator selects the appropriate calculator based on each position's asset class. Adding a new asset class requires implementing the `RiskCalculator` protocol and registering it — existing calculators and VaR methodologies are untouched.
+
 ## Interface Contract
 
 ```python
@@ -1112,3 +1210,4 @@ risk-engine
 - [Security Master](security-master.md) — provides instrument metadata for factor mapping and sector classification
 - [Performance Attribution](performance-attribution.md) — consumes risk snapshots for risk-based P&L attribution
 - [Cash Management](cash-management.md) — risk events may trigger cash reserve adjustments
+- [System Overview — Multi-Asset Strategy](overview.md#multi-asset-class-strategy) — asset class phasing and extensibility pattern

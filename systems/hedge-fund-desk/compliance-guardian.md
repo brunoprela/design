@@ -148,6 +148,9 @@ class RuleType(StrEnum):
     COUNTRY_LIMIT = "country_limit"
     RESTRICTED_LIST = "restricted_list"
     SHORT_SELLING = "short_selling"
+    AGGREGATE_EXPOSURE = "aggregate_exposure"   # total exposure to an entity across asset classes
+    ASSET_CLASS_LIMIT = "asset_class_limit"     # max % in a single asset class
+    LEVERAGE_LIMIT = "leverage_limit"           # gross exposure / NAV
 
 
 class Severity(StrEnum):
@@ -521,6 +524,74 @@ class ShortSellingEvaluator(RuleEvaluator):
         )
 ```
 
+### Multi-Asset Compliance: Aggregate Exposure
+
+In a multi-asset portfolio, concentration limits must account for **total economic exposure** to an entity, not just equity weight. Holding 4% of NAV in AAPL shares and writing AAPL put options that add another 3% delta-equivalent exposure means 7% total AAPL exposure — even though no single position exceeds a 5% limit.
+
+The `AggregateExposureEvaluator` resolves this by grouping positions by their **underlying entity** (using the security master's `underlying_id` for derivatives):
+
+```python
+class AggregateExposureEvaluator(RuleEvaluator):
+    """Check total delta-equivalent exposure to a single entity across all asset classes.
+    
+    Groups: AAPL shares + AAPL call options + TRS referencing AAPL = total AAPL exposure.
+    """
+
+    def evaluate(
+        self, rule: RuleDefinition, state: PortfolioState,
+    ) -> EvaluationResult:
+        limit_pct = Decimal(rule.parameters["limit_pct"])
+        limit_decimal = limit_pct / Decimal("100")
+
+        # Group positions by underlying entity (derivatives → underlying_id)
+        entity_exposure: dict[str, Decimal] = {}
+        entity_instruments: dict[str, list[str]] = {}
+
+        for inst_id, pos in state.positions.items():
+            # Use underlying_id for derivatives, instrument_id for cash instruments
+            entity = getattr(pos, "underlying_id", None) or inst_id
+            # Use delta-adjusted exposure for derivatives, market_value for cash
+            exposure = getattr(pos, "delta_equivalent_value", pos.market_value)
+
+            entity_exposure[entity] = entity_exposure.get(entity, Decimal("0")) + abs(exposure)
+            entity_instruments.setdefault(entity, []).append(inst_id)
+
+        # Check each entity against the limit
+        offending = []
+        worst_entity = ""
+        worst_weight = Decimal("0")
+
+        for entity, total in entity_exposure.items():
+            weight = total / state.total_nav if state.total_nav else Decimal("0")
+            if weight > worst_weight:
+                worst_weight = weight
+                worst_entity = entity
+            if weight > limit_decimal:
+                offending.extend(entity_instruments[entity])
+
+        passed = len(offending) == 0
+        headroom = limit_decimal - worst_weight
+
+        return EvaluationResult(
+            rule_id=rule.id,
+            rule_type=rule.rule_type,
+            rule_name=rule.name,
+            passed=passed,
+            severity=rule.severity,
+            current_value=worst_weight * Decimal("100"),
+            limit_value=limit_pct,
+            headroom=headroom * Decimal("100"),
+            offending_instruments=offending,
+            details=(
+                f"Largest aggregate entity exposure: {worst_entity} at {worst_weight:.2%} "
+                f"across {len(entity_instruments.get(worst_entity, []))} positions "
+                f"(limit: {limit_pct}%)"
+            ),
+        )
+```
+
+The `PositionInfo` class gains an optional `underlying_id` and `delta_equivalent_value` to support this aggregation. For cash equities, `underlying_id` is the instrument itself and `delta_equivalent_value` equals `market_value`. For a call option on AAPL with delta 0.6, `underlying_id` is AAPL's instrument_id and `delta_equivalent_value` is `contracts × delta × underlying_price × multiplier`.
+
 ### Rule Engine Orchestrator
 
 ```python
@@ -552,6 +623,8 @@ EVALUATOR_REGISTRY: dict[RuleType, RuleEvaluator] = {
     RuleType.COUNTRY_LIMIT: CountryLimitEvaluator(),
     RuleType.RESTRICTED_LIST: RestrictedListEvaluator(),
     RuleType.SHORT_SELLING: ShortSellingEvaluator(),
+    RuleType.AGGREGATE_EXPOSURE: AggregateExposureEvaluator(),
+    # ASSET_CLASS_LIMIT and LEVERAGE_LIMIT evaluators follow the same pattern
 }
 
 
@@ -1076,3 +1149,4 @@ compliance-guardian
 - [Alpha Engine](alpha-engine.md) — generates order intents that trigger pre-trade compliance checks
 - [Security Master](security-master.md) — instrument metadata for sector/country rule evaluation
 - [Market Data Ingestion](market-data-ingestion.md) — prices for market value calculation in rule evaluation
+- [System Overview — Multi-Asset Strategy](overview.md#multi-asset-class-strategy) — aggregate exposure across asset classes

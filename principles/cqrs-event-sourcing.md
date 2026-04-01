@@ -226,12 +226,61 @@ Different aggregates (e.g., positions in different portfolios, or positions vs. 
 
 This is the correct model for most financial systems: within a single position, consistency is mandatory. Across the portfolio's risk view, a few milliseconds of staleness is acceptable.
 
+## Read Model Drift and Rebuild
+
+A recurring operational challenge with CQRS: the read model diverges from the event store. This happens more often than teams expect — a bug in projection logic, a missed event during deployment, a schema migration that silently dropped rows.
+
+### Detecting Drift
+
+You cannot fix drift you cannot see. Build detection into the system from day one:
+
+- **Periodic reconciliation job** — compare a sample of read model records against a fresh replay from the event store. A mismatch triggers an alert.
+- **Checksum comparison** — the event store tracks the count and hash of events per aggregate. The read model maintains a `last_event_sequence` column. A discrepancy signals drift.
+- **Business-level smoke tests** — for positions, assert that `sum(lots) == total_quantity` after every batch of updates. For P&L, assert that `realized + unrealized == total`. These invariant checks catch drift even when the mechanism above doesn't.
+
+### Rebuilding Projections
+
+Every projection must be rebuildable from the event store. This is the fundamental contract of event sourcing — the event store is the source of truth, projections are disposable.
+
+```mermaid
+graph LR
+    ES[(Event Store)] -->|"full replay"| REBUILD[Rebuild Process]
+    REBUILD -->|"truncate + reproject"| RM[(Read Model)]
+    REBUILD -->|"compare"| LIVE[Live Read Model]
+    LIVE -->|"swap if match"| RM
+```
+
+Rebuild strategies:
+
+| Strategy | When to Use | Trade-off |
+|---|---|---|
+| **Truncate and replay** | Small event store, low-traffic window | Simplest. Read model unavailable during rebuild |
+| **Shadow rebuild** | Large event store, cannot afford downtime | Build new projection alongside live one, swap when caught up. Requires 2x storage |
+| **Incremental rebuild** | Drift detected in specific aggregates | Replay only affected aggregates. Fast but requires knowing which are broken |
+
+Design for rebuild from the start:
+
+1. **Every projection has a `rebuild()` method** — not just a `handle(event)`. The rebuild method truncates its table and replays all events.
+2. **Projections track their high-water mark** — `last_processed_sequence` per aggregate, so they can resume after a crash without replaying everything.
+3. **Rebuild is a first-class operation** — it has a CLI command, it is tested in CI, and it runs in under a defined SLA (e.g., "positions read model rebuilds in < 5 minutes for 1M events").
+
+### Snapshot Invalidation
+
+Snapshots can also drift if they were taken with buggy aggregate logic. When you fix a bug in the aggregate's `apply()` method:
+
+1. Delete all snapshots for the affected aggregate type
+2. Rebuild read models from events (not from snapshots)
+3. Generate new snapshots from the corrected replay
+
+Never treat a snapshot as authoritative. It is an optimization that can always be regenerated.
+
 ## Failure Modes
 
 | Failure | Cause | Mitigation |
 |---|---|---|
 | Projection lag | Consumer falls behind event stream | Monitor lag, alert if read model is stale |
 | Projection corruption | Bug in projection logic | Rebuild projection from event stream (the source of truth) |
+| Projection drift | Missed events, deployment gap, schema migration | Periodic reconciliation job, checksum comparison, invariant assertions |
 | Event schema change | New event version breaks projection | Versioned events, upcasters that transform old events to new schema |
 | Snapshot staleness | Snapshot taken with buggy logic | Rebuild from events (snapshots are an optimization, not source of truth) |
 | Concurrency conflict | Two commands target same aggregate simultaneously | Optimistic concurrency via sequence_number, retry with backoff |

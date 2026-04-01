@@ -92,6 +92,8 @@ class AssetClass(StrEnum):
     FUTURE = "future"
     ETF = "etf"
     FX = "fx"
+    SWAP = "swap"
+    PRIVATE = "private"
 
 
 class IdentifierType(StrEnum):
@@ -131,6 +133,126 @@ class InstrumentIdentifier(BaseModel):
     is_primary: bool = False
     valid_from: date
     valid_to: date | None = None    # None = currently valid
+```
+
+### Asset-Class Extensions (Base + Extension Pattern)
+
+The `Instrument` model above captures common attributes shared by all asset classes. Asset-class-specific attributes live in extension models that reference the base instrument by ID. This avoids a monolithic model with dozens of nullable columns:
+
+```python
+# extensions.py
+
+class EquityExtension(BaseModel):
+    """Equity-specific attributes."""
+    model_config = ConfigDict(frozen=True)
+
+    instrument_id: UUID
+    shares_outstanding: Decimal | None = None
+    dividend_yield: Decimal | None = None
+    market_cap: Decimal | None = None
+    free_float_pct: Decimal | None = None
+
+
+class FixedIncomeExtension(BaseModel):
+    """Bond-specific attributes."""
+    model_config = ConfigDict(frozen=True)
+
+    instrument_id: UUID
+    coupon_rate: Decimal
+    coupon_frequency: int          # payments per year (1, 2, 4)
+    maturity_date: date
+    issue_date: date
+    par_value: Decimal             # typically 1000
+    day_count_convention: str      # "ACT/360", "30/360", "ACT/ACT"
+    credit_rating: str | None = None  # "AAA", "BB+", etc.
+    issuer: str | None = None
+    callable: bool = False
+    call_date: date | None = None
+
+
+class OptionExtension(BaseModel):
+    """Listed option-specific attributes."""
+    model_config = ConfigDict(frozen=True)
+
+    instrument_id: UUID
+    underlying_id: UUID            # reference to the underlying instrument
+    strike_price: Decimal
+    expiry_date: date
+    option_type: str               # "call" | "put"
+    exercise_style: str            # "american" | "european"
+    contract_multiplier: int       # typically 100 for equity options
+
+
+class FutureExtension(BaseModel):
+    """Futures contract-specific attributes."""
+    model_config = ConfigDict(frozen=True)
+
+    instrument_id: UUID
+    underlying_id: UUID
+    expiry_date: date
+    contract_size: Decimal
+    tick_size: Decimal
+    tick_value: Decimal
+    margin_initial: Decimal | None = None
+    margin_maintenance: Decimal | None = None
+
+
+class FXExtension(BaseModel):
+    """FX pair-specific attributes."""
+    model_config = ConfigDict(frozen=True)
+
+    instrument_id: UUID
+    base_currency: str             # "EUR" in EUR/USD
+    quote_currency: str            # "USD" in EUR/USD
+    settlement_days: int = 2       # T+2 for spot
+    pip_size: Decimal              # 0.0001 for most, 0.01 for JPY pairs
+
+
+class SwapExtension(BaseModel):
+    """OTC swap-specific attributes (IRS, CDS, TRS)."""
+    model_config = ConfigDict(frozen=True)
+
+    instrument_id: UUID
+    swap_type: str                 # "irs" | "cds" | "trs"
+    notional: Decimal
+    fixed_rate: Decimal | None = None
+    floating_index: str | None = None  # "SOFR", "EURIBOR"
+    maturity_date: date
+    payment_frequency: int         # payments per year
+    underlying_id: UUID | None = None  # for TRS: the reference asset
+```
+
+### Extension Resolution Protocol
+
+Other modules need to access the full instrument (base + extension) without knowing which extension type to load. The security master exposes this through the reader interface:
+
+```python
+# interface.py (additions to SecurityMasterReader)
+
+class InstrumentWithExtension(BaseModel):
+    """Base instrument enriched with asset-class-specific attributes."""
+    base: Instrument
+    extension: (
+        EquityExtension
+        | FixedIncomeExtension
+        | OptionExtension
+        | FutureExtension
+        | FXExtension
+        | SwapExtension
+        | None
+    ) = None
+
+
+class SecurityMasterReader(Protocol):
+    # ... existing methods ...
+
+    async def get_with_extension(self, instrument_id: UUID) -> InstrumentWithExtension:
+        """Load instrument with its asset-class-specific extension."""
+        ...
+
+    async def get_underlying(self, instrument_id: UUID) -> Instrument | None:
+        """For derivatives: resolve the underlying instrument."""
+        ...
 ```
 
 ### Identifier Resolution
@@ -239,6 +361,73 @@ CREATE INDEX ix_sm_identifiers_instrument ON security_master.instrument_identifi
 -- Full-text search on instrument name
 CREATE INDEX ix_sm_instruments_name_search ON security_master.instruments
     USING gin (to_tsvector('english', name));
+
+-- Asset-class extension tables (one per asset class)
+CREATE TABLE security_master.equity_extensions (
+    instrument_id       UUID PRIMARY KEY REFERENCES security_master.instruments(id),
+    shares_outstanding  NUMERIC(18,0),
+    dividend_yield      NUMERIC(8,6),
+    market_cap          NUMERIC(18,2),
+    free_float_pct      NUMERIC(5,2)
+);
+
+CREATE TABLE security_master.fixed_income_extensions (
+    instrument_id       UUID PRIMARY KEY REFERENCES security_master.instruments(id),
+    coupon_rate         NUMERIC(8,6) NOT NULL,
+    coupon_frequency    INTEGER NOT NULL,
+    maturity_date       DATE NOT NULL,
+    issue_date          DATE NOT NULL,
+    par_value           NUMERIC(18,2) NOT NULL DEFAULT 1000,
+    day_count_convention VARCHAR(16) NOT NULL,  -- "ACT/360", "30/360"
+    credit_rating       VARCHAR(8),
+    issuer              VARCHAR(255),
+    callable            BOOLEAN NOT NULL DEFAULT FALSE,
+    call_date           DATE
+);
+
+CREATE TABLE security_master.option_extensions (
+    instrument_id       UUID PRIMARY KEY REFERENCES security_master.instruments(id),
+    underlying_id       UUID NOT NULL REFERENCES security_master.instruments(id),
+    strike_price        NUMERIC(18,8) NOT NULL,
+    expiry_date         DATE NOT NULL,
+    option_type         VARCHAR(4) NOT NULL,    -- "call" | "put"
+    exercise_style      VARCHAR(10) NOT NULL,   -- "american" | "european"
+    contract_multiplier INTEGER NOT NULL DEFAULT 100
+);
+
+CREATE TABLE security_master.future_extensions (
+    instrument_id       UUID PRIMARY KEY REFERENCES security_master.instruments(id),
+    underlying_id       UUID NOT NULL REFERENCES security_master.instruments(id),
+    expiry_date         DATE NOT NULL,
+    contract_size       NUMERIC(18,8) NOT NULL,
+    tick_size           NUMERIC(18,8) NOT NULL,
+    tick_value           NUMERIC(18,8) NOT NULL,
+    margin_initial      NUMERIC(18,2),
+    margin_maintenance  NUMERIC(18,2)
+);
+
+CREATE TABLE security_master.fx_extensions (
+    instrument_id       UUID PRIMARY KEY REFERENCES security_master.instruments(id),
+    base_currency       VARCHAR(3) NOT NULL,
+    quote_currency      VARCHAR(3) NOT NULL,
+    settlement_days     INTEGER NOT NULL DEFAULT 2,
+    pip_size            NUMERIC(10,6) NOT NULL
+);
+
+CREATE TABLE security_master.swap_extensions (
+    instrument_id       UUID PRIMARY KEY REFERENCES security_master.instruments(id),
+    swap_type           VARCHAR(8) NOT NULL,    -- "irs" | "cds" | "trs"
+    notional            NUMERIC(18,2) NOT NULL,
+    fixed_rate          NUMERIC(8,6),
+    floating_index      VARCHAR(32),            -- "SOFR", "EURIBOR"
+    maturity_date       DATE NOT NULL,
+    payment_frequency   INTEGER NOT NULL,
+    underlying_id       UUID REFERENCES security_master.instruments(id)
+);
+
+CREATE INDEX ix_option_underlying ON security_master.option_extensions (underlying_id);
+CREATE INDEX ix_future_underlying ON security_master.future_extensions (underlying_id);
+CREATE INDEX ix_swap_underlying ON security_master.swap_extensions (underlying_id);
 ```
 
 ### Multi-Source Merge Strategy
@@ -329,6 +518,9 @@ class CorporateActionProcessor:
 | Stale reference data | Source feed delayed | Trades routed with wrong attributes | Freshness monitoring, dual-source validation |
 | Corporate action missed | Split not processed before market open | Position quantities wrong, P&L incorrect | Pre-market corporate action check, reconciliation |
 | Cache inconsistency | Instrument updated but cache not invalidated | Modules see stale data | Cache invalidation on update events, short TTL |
+| Missing extension data | Instrument created without asset-class extension | Downstream modules fail on missing attributes | Enforce extension creation in same transaction as base instrument |
+| Underlying not found | Derivative references non-existent underlying | Option/future pricing fails | Foreign key constraint, validate before insert |
+| Extension type mismatch | Asset class changed but extension table not updated | Stale extension data returned | Immutable asset class — create new instrument instead of changing type |
 
 ## Dependencies
 
@@ -344,3 +536,4 @@ security-master
 
 - [Market Data Ingestion](market-data-ingestion.md) — consumes instrument identifiers for price normalization
 - [Position Keeping](position-keeping.md) — consumes corporate action events to adjust positions
+- [System Overview — Multi-Asset Strategy](overview.md#multi-asset-class-strategy) — phasing plan for asset class rollout

@@ -134,6 +134,63 @@ class MarketDataSubscriber(Protocol):
     async def subscribe(self, instrument_ids: list[str]) -> AsyncIterator[PriceSnapshot]: ...
 ```
 
+### Asset-Class-Specific Data Shapes
+
+The base `PriceSnapshot` (bid/ask/mid/volume) is sufficient for equities and FX. Other asset classes require additional pricing fields. Rather than bloating the base model, the market data module uses a `PriceDataShape` protocol that asset-class adapters implement:
+
+```python
+# shapes.py — asset-class-specific price data extensions
+
+class FixedIncomePriceSnapshot(PriceSnapshot):
+    """Bond pricing adds yield, spread, accrued interest, and duration."""
+    yield_to_maturity: Decimal
+    spread_to_benchmark: Decimal | None = None
+    accrued_interest: Decimal = Decimal(0)
+    modified_duration: Decimal | None = None
+    convexity: Decimal | None = None
+
+
+class OptionPriceSnapshot(PriceSnapshot):
+    """Option pricing adds Greeks and implied volatility."""
+    implied_volatility: Decimal
+    delta: Decimal
+    gamma: Decimal
+    theta: Decimal
+    vega: Decimal
+    rho: Decimal | None = None
+    underlying_price: Decimal
+    intrinsic_value: Decimal
+    time_value: Decimal
+
+
+class FuturePriceSnapshot(PriceSnapshot):
+    """Futures pricing adds settlement price and open interest."""
+    settlement_price: Decimal        # daily settlement for margining
+    open_interest: int | None = None
+    basis: Decimal | None = None     # futures price - spot price
+
+
+class FXForwardSnapshot(PriceSnapshot):
+    """FX forward pricing adds forward points and tenor."""
+    forward_points: Decimal          # pips above/below spot
+    tenor: str                       # "1W", "1M", "3M", "1Y"
+    spot_rate: Decimal
+
+
+class VolatilitySurface(BaseModel):
+    """Options vol surface — a grid of implied vols by strike and expiry."""
+    model_config = ConfigDict(frozen=True)
+
+    instrument_id: str               # the underlying
+    timestamp: datetime
+    strikes: list[Decimal]
+    expiries: list[str]              # ["2026-06-19", "2026-09-18", ...]
+    vols: list[list[Decimal]]        # vols[expiry_idx][strike_idx]
+    source: str
+```
+
+The `prices.normalized` Kafka event includes an `asset_class` field so consumers can deserialize the correct shape. The `PriceSnapshot` base fields are always present — extended fields are only populated when the data source provides them. Downstream modules (risk, exposure) access the extended fields when available and fall back to base-level data when they are not.
+
 ### Bloomberg Adapter
 
 ```python
@@ -485,3 +542,5 @@ market-data-ingestion
 ## Related Documents
 
 - [Security Master](security-master.md) — instrument reference data this module uses for normalization
+- [System Overview — Multi-Asset Strategy](overview.md#multi-asset-class-strategy) — asset class phasing and data shape requirements
+- [Risk Engine](risk-engine.md) — consumes extended price data (Greeks, yields) for multi-asset risk calculations

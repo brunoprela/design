@@ -407,6 +407,117 @@ class PositionAggregate:
         return aggregate
 ```
 
+### Asset-Class Position Strategy
+
+Different asset classes calculate position value, cost basis, and P&L differently. Rather than branching on `asset_class` throughout the aggregate, the position module delegates to a `PositionStrategy` protocol:
+
+```python
+# strategy.py
+
+from typing import Protocol
+from decimal import Decimal
+
+
+class PositionStrategy(Protocol):
+    """Asset-class-specific position calculation logic."""
+
+    def market_value(self, quantity: Decimal, market_price: Decimal, **kwargs) -> Decimal:
+        """Calculate the market value of a position."""
+        ...
+
+    def unrealized_pnl(
+        self, quantity: Decimal, avg_cost: Decimal, market_price: Decimal, **kwargs,
+    ) -> Decimal:
+        """Calculate unrealized P&L."""
+        ...
+
+    def position_unit_label(self) -> str:
+        """Human-readable label for the position unit (shares, contracts, notional)."""
+        ...
+
+
+class EquityPositionStrategy:
+    """Equities: value = quantity × price."""
+
+    def market_value(self, quantity: Decimal, market_price: Decimal, **kwargs) -> Decimal:
+        return quantity * market_price
+
+    def unrealized_pnl(
+        self, quantity: Decimal, avg_cost: Decimal, market_price: Decimal, **kwargs,
+    ) -> Decimal:
+        return quantity * (market_price - avg_cost)
+
+    def position_unit_label(self) -> str:
+        return "shares"
+
+
+class FixedIncomePositionStrategy:
+    """Bonds: value = (par_held × clean_price / 100) + accrued_interest."""
+
+    def market_value(self, quantity: Decimal, market_price: Decimal, **kwargs) -> Decimal:
+        accrued = kwargs.get("accrued_interest", Decimal(0))
+        return (quantity * market_price / Decimal(100)) + accrued
+
+    def unrealized_pnl(
+        self, quantity: Decimal, avg_cost: Decimal, market_price: Decimal, **kwargs,
+    ) -> Decimal:
+        accrued = kwargs.get("accrued_interest", Decimal(0))
+        dirty_value = (quantity * market_price / Decimal(100)) + accrued
+        cost_basis = quantity * avg_cost / Decimal(100)
+        return dirty_value - cost_basis
+
+    def position_unit_label(self) -> str:
+        return "par_value"
+
+
+class OptionPositionStrategy:
+    """Options: value = contracts × premium × multiplier."""
+
+    def market_value(self, quantity: Decimal, market_price: Decimal, **kwargs) -> Decimal:
+        multiplier = kwargs.get("contract_multiplier", Decimal(100))
+        return quantity * market_price * multiplier
+
+    def unrealized_pnl(
+        self, quantity: Decimal, avg_cost: Decimal, market_price: Decimal, **kwargs,
+    ) -> Decimal:
+        multiplier = kwargs.get("contract_multiplier", Decimal(100))
+        return quantity * (market_price - avg_cost) * multiplier
+
+    def position_unit_label(self) -> str:
+        return "contracts"
+
+
+class FuturePositionStrategy:
+    """Futures: value based on tick value, P&L from daily settlement (variation margin)."""
+
+    def market_value(self, quantity: Decimal, market_price: Decimal, **kwargs) -> Decimal:
+        contract_size = kwargs.get("contract_size", Decimal(1))
+        return quantity * market_price * contract_size
+
+    def unrealized_pnl(
+        self, quantity: Decimal, avg_cost: Decimal, market_price: Decimal, **kwargs,
+    ) -> Decimal:
+        contract_size = kwargs.get("contract_size", Decimal(1))
+        return quantity * (market_price - avg_cost) * contract_size
+
+    def position_unit_label(self) -> str:
+        return "contracts"
+
+
+# Strategy registry — maps asset class to strategy implementation
+POSITION_STRATEGIES: dict[str, PositionStrategy] = {
+    "equity": EquityPositionStrategy(),
+    "etf": EquityPositionStrategy(),      # ETFs behave like equities
+    "fixed_income": FixedIncomePositionStrategy(),
+    "option": OptionPositionStrategy(),
+    "future": FuturePositionStrategy(),
+}
+```
+
+The `PositionAggregate` and `MarkToMarketEngine` use the strategy for value calculations. The aggregate itself (FIFO lot matching, event application) remains asset-class-agnostic — it operates on quantities and costs. Only the _interpretation_ of value differs per asset class.
+
+Adding a new asset class requires: (1) an extension in the security master, (2) a `PositionStrategy` implementation, and (3) registration in `POSITION_STRATEGIES`. The aggregate, event store, and read models are untouched.
+
 ### Trade Event Handler
 
 ```python
@@ -628,3 +739,4 @@ position-keeping
 - [Order Management](order-management.md) — produces the trade events that drive position changes
 - [Exposure Calculation](exposure-calculation.md) — consumes position changes
 - [Risk Engine](risk-engine.md) — consumes position changes for risk calculation
+- [System Overview — Multi-Asset Strategy](overview.md#multi-asset-class-strategy) — asset class phasing and extensibility pattern

@@ -8,6 +8,120 @@ Most hedge funds cobble this together from vendor systems (Bloomberg Terminal, p
 
 This platform replaces that patchwork with a modular monolith — a single deployable system with strong internal boundaries, real-time event flow, and a unified data model. Each module is independently designed but communicates through well-defined interfaces and Kafka events.
 
+## Tenancy Model
+
+This platform is a **multi-fund, multi-portfolio** system. A single deployment serves multiple hedge funds, each with multiple portfolios (strategies, sub-funds, managed accounts). Funds are the top-level isolation boundary — they must never see each other's data. Portfolios are the operational partition within a fund.
+
+| Question | Answer | Implication |
+|---|---|---|
+| How many funds? | Many (10–100+) per deployment | Fund-level data isolation is a hard requirement |
+| How many portfolios per fund? | Many (10–100) | Portfolio is the partition key for positions, orders, risk, compliance |
+| Who are the users? | PMs, analysts, risk managers, compliance officers, operations — a user may belong to multiple funds with different roles | RBAC per role, OpenFGA for fund membership + portfolio-level access |
+| Data isolation? | Schema-per-fund with RLS as defense-in-depth | A query in Fund A physically cannot reach Fund B's tables |
+
+### Fund Isolation Strategy: Schema-Per-Fund
+
+Each fund gets its own set of PostgreSQL schemas. Shared reference data (instruments, market data) lives in common schemas accessible to all funds:
+
+```
+database: minihedge
+├── fund_alpha/                     # Fund Alpha's private data
+│   ├── fund_alpha.positions
+│   ├── fund_alpha.orders
+│   ├── fund_alpha.risk
+│   ├── fund_alpha.compliance
+│   ├── fund_alpha.cash
+│   ├── fund_alpha.exposure
+│   ├── fund_alpha.performance
+│   ├── fund_alpha.alpha
+│   └── fund_alpha.audit
+├── fund_beta/                      # Fund Beta's private data
+│   ├── fund_beta.positions
+│   ├── fund_beta.orders
+│   └── ...
+├── shared/                         # Cross-fund reference data
+│   ├── security_master.instruments
+│   ├── security_master.instrument_identifiers
+│   ├── market_data.prices
+│   └── market_data.ohlcv_*
+└── platform/                       # Platform management
+    ├── platform.funds              # Fund registry
+    ├── platform.users              # User directory
+    └── platform.fund_memberships   # User → fund → role mapping
+```
+
+**Why schema-per-fund, not row-level security alone?** Schema-per-fund gives hard query boundaries — a bug in Fund A's position query cannot reach Fund B's tables because they live in different schemas. RLS on shared schemas (market_data, security_master) provides defense-in-depth for data that all funds can read. See [Multi-Tenancy](../../patterns/data-access/multi-tenancy.md) for the implementation pattern.
+
+**Why not database-per-fund?** For most deployments (< 100 funds), separate databases add operational overhead (separate backups, connection pools, monitoring) without meaningful benefit over schema isolation. If a specific fund requires full database isolation (regulatory, contractual), the application code is the same — only the connection configuration changes.
+
+### Kafka Topic Scoping
+
+Kafka topics are fund-scoped using a naming convention. Each fund's events are isolated at the topic level — a consumer for Fund Alpha never sees Fund Beta's events:
+
+```
+fund-alpha.positions.changed      # Fund Alpha's position events
+fund-alpha.trades.executed        # Fund Alpha's trade events
+fund-beta.positions.changed       # Fund Beta's — separate topic, separate partitions
+
+# Shared topics (no fund prefix)
+prices.normalized                  # Market data — same prices for all funds
+instruments.updated                # Reference data — shared
+corporate-actions.announced        # Corporate actions — shared
+```
+
+**Partition keys within fund topics:** `portfolio_id` is the default partition key. This ensures all events for a portfolio land on the same partition, preserving ordering for position calculations, compliance checks, and P&L attribution.
+
+### Fund Lifecycle
+
+| Operation | What Happens |
+|---|---|
+| **Onboard fund** | Create fund schemas (one per module), run migrations, create fund admin user, create Kafka topics, seed compliance rules |
+| **Offboard fund** | Export all data (regulatory retention), drop fund schemas, delete Kafka topics, revoke user access, retain audit trail in cold storage per retention policy |
+| **User joins fund** | Create fund_membership record with role, grant access to fund schemas via search_path |
+| **User leaves fund** | Revoke fund_membership, remove schema access, audit log entry |
+
+## Multi-Asset Class Strategy
+
+The platform supports all asset classes a hedge fund may trade. Rather than building a monolithic model that tries to represent every instrument type in a single structure, the design uses a **base-plus-extension pattern** where common attributes are shared and asset-class-specific attributes live in extension tables and strategy implementations.
+
+### Supported Asset Classes
+
+| Asset Class | Position Unit | Pricing Model | Settlement | Key Differences |
+|---|---|---|---|---|
+| **Equities** | Shares | Market price (bid/ask/mid) | T+1 (US), T+2 (EU) | FIFO lots, dividends, splits |
+| **Fixed Income** | Par value | Clean price + accrued interest | T+1 | Coupon, maturity, duration, convexity |
+| **FX (Spot & Forwards)** | Notional (base currency) | FX rate | T+2 (spot), custom (forward) | Two-leg settlement, no "shares" |
+| **Listed Options** | Contracts (× multiplier) | Options model (Black-Scholes) | T+1 | Strike, expiry, Greeks, exercise/assignment |
+| **Futures** | Contracts | Mark-to-market (daily settlement) | Daily margin | Variation margin, roll mechanics, expiry |
+| **Swaps (IRS, CDS, TRS)** | Notional | Model-based (discounted cash flows) | Per reset schedule | OTC, fixed/floating legs, netting |
+| **Private/Illiquid** | Units or shares | Quarterly NAV (fund admin) | Custom | Capital calls, distributions, no market price |
+
+### Extensibility Pattern
+
+The core insight: **every module needs an asset-class-aware extension point**, but the extension should not infect the base architecture. Each module defines a `Strategy` protocol that asset-class-specific implementations satisfy:
+
+```
+SecurityMaster:    InstrumentExtension protocol  → EquityExtension, BondExtension, OptionExtension
+PositionKeeping:   PositionStrategy protocol     → EquityPositionStrategy, BondPositionStrategy, ...
+RiskEngine:        RiskCalculator protocol       → EquityRiskCalculator, FixedIncomeRiskCalculator, ...
+ExposureCalc:      ExposureNormalizer protocol   → equity=market_value, option=delta-adjusted, ...
+CashManagement:    SettlementConvention protocol → T+1, T+2, daily margin, ...
+Compliance:        ExposureAggregator protocol   → total AAPL = shares + options + TRS referencing AAPL
+MarketData:        PriceDataShape protocol       → bid/ask/mid, yield/spread, vol surface, ...
+```
+
+### Implementation Phasing
+
+| Phase | Asset Classes | Rationale |
+|---|---|---|
+| **Phase 0–1** | Equities only | Prove the architecture, establish all module boundaries |
+| **Phase 2** | + Fixed Income | Most common after equities, required for multi-asset funds |
+| **Phase 3** | + FX | Needed once portfolios hold multi-currency instruments |
+| **Phase 4** | + Listed Options, Futures | Exchange-traded derivatives, standardized contracts |
+| **Phase 5+** | + Swaps, Private/Illiquid | OTC instruments, complex pricing models |
+
+Each new asset class requires: (1) security master extension table + model, (2) position strategy implementation, (3) risk calculator, (4) exposure normalizer, (5) settlement convention, (6) market data adapter. The base architecture and existing asset classes are untouched.
+
 ## System Architecture
 
 ```mermaid
@@ -211,31 +325,74 @@ sequenceDiagram
 
 ## Kafka Topic Map
 
-| Topic | Producer | Consumers | Partition Key | Retention |
-|---|---|---|---|---|
-| `prices.normalized` | Market Data | Positions, Risk, Exposure, Alpha | `instrument_id` | 7 days |
-| `instruments.updated` | Security Master | Market Data, Positions | `instrument_id` | 30 days |
-| `corporate-actions.announced` | Security Master | Positions, Compliance, Cash Management | `instrument_id` | 90 days |
-| `trades.executed` | Order Management | Positions, Cash, Risk Engine, Exposure, Audit | `instrument_id` ¹ | 30 days |
-| `trades.pending` | Order Management | Compliance | `portfolio_id` | 7 days |
-| `trades.approved` | Compliance | Order Management | `portfolio_id` | 7 days |
-| `trades.rejected` | Compliance | Order Management, Risk Engine, Exposure, Audit | `portfolio_id` | 30 days |
-| `positions.changed` | Positions | Risk, Exposure, Compliance, Audit | `portfolio_id:instrument_id` | 30 days |
-| `pnl.updated` | Positions | Performance Attribution, Audit | `portfolio_id` | 30 days |
-| `order-intents.generated` | Alpha Engine | Order Management | `portfolio_id` | 7 days |
-| `exposures.updated` | Exposure | Alpha, Risk | `portfolio_id` | 7 days |
-| `risk.calculated` | Risk Engine | Alpha, Compliance | `portfolio_id` | 30 days |
-| `compliance.violations` | Compliance | Audit | `portfolio_id` | 90 days |
-| `orders.created` | OMS | Audit | `portfolio_id` | 30 days |
-| `orders.filled` | OMS | Positions, Cash Management, Audit | `portfolio_id` | 30 days |
-| `risk.breach` | Risk Engine | Compliance, Alerting | `portfolio_id` | 90 days |
-| `cash.projected` | Cash Management | — | `portfolio_id` | 7 days |
-| `cash.settlement_due` | Cash Management | Operations, Alerting | `portfolio_id` | 30 days |
-| `cash.balance_warning` | Cash Management | Risk, Alerting | `portfolio_id` | 30 days |
-| `attribution.calculated` | Performance | — | `portfolio_id` | 30 days |
-| `market-data.status` | Market Data | Monitoring | `source` | 7 days |
+Fund-specific topics use the `{fund_slug}.` prefix (see [Kafka Topic Scoping](#kafka-topic-scoping) above). Shared topics have no prefix. The table below shows the logical topic name — prepend the fund slug for fund-scoped topics.
+
+| Topic | Scope | Producer | Consumers | Partition Key | Retention |
+|---|---|---|---|---|---|
+| `{fund}.trades.executed` | Fund | Order Management | Positions, Cash, Risk, Exposure, Audit | `instrument_id` ¹ | 30 days |
+| `{fund}.trades.pending` | Fund | Order Management | Compliance | `portfolio_id` | 7 days |
+| `{fund}.trades.approved` | Fund | Compliance | Order Management | `portfolio_id` | 7 days |
+| `{fund}.trades.rejected` | Fund | Compliance | OMS, Risk, Exposure, Audit | `portfolio_id` | 30 days |
+| `{fund}.positions.changed` | Fund | Positions | Risk, Exposure, Compliance, Audit | `portfolio_id:instrument_id` | 30 days |
+| `{fund}.pnl.updated` | Fund | Positions | Performance Attribution, Audit | `portfolio_id` | 30 days |
+| `{fund}.order-intents.generated` | Fund | Alpha Engine | Order Management | `portfolio_id` | 7 days |
+| `{fund}.exposures.updated` | Fund | Exposure | Alpha, Risk | `portfolio_id` | 7 days |
+| `{fund}.risk.calculated` | Fund | Risk Engine | Alpha, Compliance | `portfolio_id` | 30 days |
+| `{fund}.risk.breach` | Fund | Risk Engine | Compliance, Alerting | `portfolio_id` | 90 days |
+| `{fund}.compliance.violations` | Fund | Compliance | Audit | `portfolio_id` | 90 days |
+| `{fund}.orders.created` | Fund | OMS | Audit | `portfolio_id` | 30 days |
+| `{fund}.orders.filled` | Fund | OMS | Positions, Cash Management, Audit | `portfolio_id` | 30 days |
+| `{fund}.cash.projected` | Fund | Cash Management | — | `portfolio_id` | 7 days |
+| `{fund}.cash.settlement_due` | Fund | Cash Management | Operations, Alerting | `portfolio_id` | 30 days |
+| `{fund}.cash.balance_warning` | Fund | Cash Management | Risk, Alerting | `portfolio_id` | 30 days |
+| `{fund}.attribution.calculated` | Fund | Performance | — | `portfolio_id` | 30 days |
+| `prices.normalized` | Shared | Market Data | Positions, Risk, Exposure, Alpha | `instrument_id` | 7 days |
+| `instruments.updated` | Shared | Security Master | Market Data, Positions | `instrument_id` | 30 days |
+| `corporate-actions.announced` | Shared | Security Master | Positions, Compliance, Cash Mgmt | `instrument_id` | 90 days |
+| `market-data.status` | Shared | Market Data | Monitoring | `source` | 7 days |
 
 > ¹ `trades.executed` uses `instrument_id` as partition key — this ensures all fills for the same instrument are ordered, matching the OMS code that publishes to this topic.
+
+## Real-Time vs. EOD Processing Boundary
+
+Not everything should run in real time. Some calculations are expensive, some require finalized data, and some are only meaningful at a point-in-time snapshot. The system draws an explicit boundary:
+
+### Real-Time (Event-Driven, Continuous)
+
+These react to every event as it arrives — sub-second latency is the target:
+
+| Capability | Trigger | Why Real-Time |
+|---|---|---|
+| Position updates | `trades.executed`, `corporate-actions.announced` | PM needs current positions to make decisions |
+| Mark-to-market P&L | `prices.normalized` | Stale P&L leads to bad trading decisions |
+| Gross/net exposure | `positions.changed` | Exposure limits are guardrails — must be current |
+| Pre-trade compliance | `trades.pending` | Blocking check — cannot wait for EOD |
+| Post-trade compliance | `positions.changed` | Violations must be detected immediately |
+| Cash settlement entries | `trades.executed` | Settlement ladder must reflect intraday activity |
+
+### End-of-Day Batch (Scheduled, Sequential)
+
+These run once per day after market close, using finalized data:
+
+| Capability | Why EOD | Dependency |
+|---|---|---|
+| Price finalization | Official close prices replace intraday ticks | Market close detected |
+| Position reconciliation | Matches internal positions against prime broker statement | Broker file delivery (usually T+0 evening) |
+| NAV calculation | Requires finalized prices and reconciled positions | Price finalization + reconciliation |
+| P&L lock | Daily P&L becomes the official record for reporting | NAV calculation |
+| Full VaR recalculation | Historical simulation VaR is compute-intensive, uses finalized prices | Price finalization |
+| Performance attribution | Brinson-Fachler attribution requires finalized daily returns | P&L lock |
+| Compliance daily report | Point-in-time snapshot of all rule evaluations | Position reconciliation |
+| Audit digest | Daily summary hash for tamper evidence | All EOD steps complete |
+
+### The Grey Zone
+
+Some capabilities run in both modes:
+
+- **Risk metrics**: Intraday VaR uses approximations (delta-normal, last known covariances). EOD VaR uses full historical simulation with finalized data. The intraday number is a directional guide; the EOD number is the official risk figure.
+- **Cash projections**: Intraday projections are updated with each trade. EOD projections incorporate settlement confirmations and are the basis for margin calls.
+
+See [EOD Processing](eod-processing.md) for the sequential batch workflow.
 
 ## Module Dependency Graph
 
@@ -287,58 +444,61 @@ graph BT
 
 ### Tach Configuration
 
-```toml
-[tool.tach]
-root = "app"
-exact = true
+> **Note:** Tach v0.34+ uses a standalone `tach.toml` file with bare keys — not a `[tool.tach]` wrapper inside `pyproject.toml`. Module paths are fully qualified from the source root.
 
-[[tool.tach.modules]]
-path = "shared"
+```toml
+# tach.toml — standalone file in project root
+exact = true
+exclude = ["tests"]
+source_roots = ["."]
+
+[[modules]]
+path = "app.shared"
 depends_on = []
 
-[[tool.tach.modules]]
-path = "modules.market_data"
-depends_on = ["shared"]
+[[modules]]
+path = "app.modules.market_data"
+depends_on = ["app.shared"]
 
-[[tool.tach.modules]]
-path = "modules.security_master"
-depends_on = ["shared"]
+[[modules]]
+path = "app.modules.security_master"
+depends_on = ["app.shared"]
 
-[[tool.tach.modules]]
-path = "modules.positions"
-depends_on = ["shared", "modules.market_data"]
+[[modules]]
+path = "app.modules.positions"
+depends_on = ["app.shared", "app.modules.market_data"]
 
-[[tool.tach.modules]]
-path = "modules.order_management"
-depends_on = ["shared", "modules.compliance", "modules.security_master"]
+[[modules]]
+path = "app.modules.order_management"
+depends_on = ["app.shared", "app.modules.compliance", "app.modules.security_master"]
 
-[[tool.tach.modules]]
-path = "modules.exposure"
-depends_on = ["shared", "modules.positions", "modules.market_data", "modules.security_master"]
+[[modules]]
+path = "app.modules.exposure"
+depends_on = ["app.shared", "app.modules.positions", "app.modules.market_data", "app.modules.security_master"]
 
-[[tool.tach.modules]]
-path = "modules.risk"
-depends_on = ["shared", "modules.positions", "modules.market_data", "modules.security_master"]
+[[modules]]
+path = "app.modules.risk"
+depends_on = ["app.shared", "app.modules.positions", "app.modules.market_data", "app.modules.security_master"]
 
-[[tool.tach.modules]]
-path = "modules.alpha"
-depends_on = ["shared", "modules.positions", "modules.market_data", "modules.risk", "modules.exposure", "modules.security_master"]
+[[modules]]
+path = "app.modules.alpha"
+depends_on = ["app.shared", "app.modules.positions", "app.modules.market_data", "app.modules.risk", "app.modules.exposure", "app.modules.security_master"]
 
-[[tool.tach.modules]]
-path = "modules.compliance"
-depends_on = ["shared", "modules.positions", "modules.market_data", "modules.security_master"]
+[[modules]]
+path = "app.modules.compliance"
+depends_on = ["app.shared", "app.modules.positions", "app.modules.market_data", "app.modules.security_master"]
 
-[[tool.tach.modules]]
-path = "modules.performance"
-depends_on = ["shared", "modules.positions", "modules.market_data", "modules.risk"]
+[[modules]]
+path = "app.modules.performance"
+depends_on = ["app.shared", "app.modules.positions", "app.modules.market_data", "app.modules.risk"]
 
-[[tool.tach.modules]]
-path = "modules.cash"
-depends_on = ["shared", "modules.security_master", "modules.market_data"]
+[[modules]]
+path = "app.modules.cash"
+depends_on = ["app.shared", "app.modules.security_master", "app.modules.market_data"]
 
-[[tool.tach.modules]]
-path = "modules.audit"
-depends_on = ["shared"]
+[[modules]]
+path = "app.modules.audit"
+depends_on = ["app.shared"]
 ```
 
 ## Data Architecture
@@ -348,18 +508,29 @@ depends_on = ["shared"]
 ```mermaid
 graph TD
     subgraph "PostgreSQL (single instance)"
-        S_MD[market_data schema]
-        S_SM[security_master schema]
-        S_POS[positions schema]
-        S_RISK[risk schema]
-        S_COMP[compliance schema]
-        S_OMS[orders schema]
-        S_CASH[cash schema]
-        S_AUDIT[audit schema]
-        S_PERF[performance schema]
-        S_ALPHA[alpha schema]
-        S_EXP[exposure schema]
-        S_READ[read_models schema]
+        subgraph "Shared Schemas"
+            S_SM[security_master schema]
+            S_MD[market_data schema]
+        end
+
+        subgraph "Fund Alpha Schemas"
+            FA_POS[fund_alpha.positions]
+            FA_RISK[fund_alpha.risk]
+            FA_COMP[fund_alpha.compliance]
+            FA_OMS[fund_alpha.orders]
+            FA_CASH[fund_alpha.cash]
+            FA_AUDIT[fund_alpha.audit]
+            FA_EXP[fund_alpha.exposure]
+        end
+
+        subgraph "Fund Beta Schemas"
+            FB_POS[fund_beta.positions]
+            FB_ETC[fund_beta. ...]
+        end
+
+        subgraph "Platform"
+            S_PLAT[platform schema - fund registry, users]
+        end
     end
 
     subgraph "TimescaleDB Extension"
@@ -371,15 +542,17 @@ graph TD
     subgraph "Redis"
         CACHE_PRICES[Latest prices cache]
         CACHE_INST[Instrument lookup cache]
-        CACHE_POS[Position summary cache]
+        CACHE_POS[Position summary cache - keyed by fund:portfolio]
     end
 
     subgraph "Kafka"
-        TOPICS[20 event topics]
+        TOPICS[Fund-scoped + shared topics]
     end
 ```
 
-All modules share a single PostgreSQL instance but use separate schemas — one schema per bounded context. TimescaleDB hypertables handle time-series data. Redis caches hot-path lookups. Kafka provides the event backbone.
+All modules share a single PostgreSQL instance. **Shared reference data** (security master, market data) lives in common schemas accessible to all funds. **Fund-specific data** (positions, orders, risk, compliance, cash, audit) lives in per-fund schemas — one set of module schemas per fund. See [Tenancy Model](#tenancy-model) for the isolation strategy.
+
+TimescaleDB hypertables handle time-series data. Redis caches hot-path lookups (keyed by `fund:portfolio:instrument` for fund isolation). Kafka provides the event backbone with fund-scoped topics.
 
 This is a pragmatic starting point. Modules that outgrow the shared instance (e.g., market data at very high tick rates) can be extracted to a separate database without changing application code — only the connection configuration changes.
 
@@ -447,6 +620,22 @@ graph TD
 
 ## Implementation Roadmap
 
+### Phase 0: Skeleton & Developer Experience (Weeks 1–2)
+
+**Goal:** Prove the architecture works end-to-end. One vertical slice from simulated prices through positions to API responses.
+
+| Deliverable | Modules | Description |
+|---|---|---|
+| Project scaffold | — | pyproject.toml (uv), Docker Compose (TimescaleDB + Redis), Makefile, CI-ready quality tooling |
+| Shared kernel | Shared | Base event bus (in-process), domain errors, async database setup, structured logging, semantic types |
+| Security Master (minimal) | Security Master | Instrument model, repository, seed data (10 instruments), basic CRUD routes |
+| Market Data Simulator | Market Data | GBM price simulator with Cholesky-correlated sectors, in-memory cache, persistence |
+| Position Keeping (core) | Positions | Event-sourced aggregate, FIFO lot matching, trade handler, mark-to-market handler, read model |
+| Module enforcement | — | Tach configuration enforcing dependency rules across all modules |
+| Test foundation | — | Unit tests (aggregate, event bus, simulator), integration tests (testcontainers PostgreSQL) |
+
+**Exit criteria:** `make up && make run` starts the system. Live simulated prices flow, trades execute via API, positions and P&L update. `make check` passes all quality gates (lint, typecheck, tach, tests).
+
 ### Phase 1: Foundation & Core Data (Months 1–3)
 
 **Goal:** Data flows, positions work, basic API.
@@ -497,20 +686,20 @@ graph TD
 | Deliverable | Modules | Description |
 |---|---|---|
 | Audit Trails | Audit | Hash chain, 7-year retention, tamper detection |
-| Reconciliation | Positions | Daily broker reconciliation, break investigation workflow |
+| Reconciliation | Positions | Daily broker reconciliation, break investigation workflow — see [Reconciliation](../../patterns/data-access/reconciliation.md) |
 | Observability | Infrastructure | Prometheus metrics, Grafana dashboards, Jaeger tracing, alerting |
 | Security hardening | Infrastructure | MFA enforcement, OpenFGA portfolio access, encryption at rest |
-| Disaster recovery | Infrastructure | Backup/restore procedures, failover testing |
+| Disaster recovery | Infrastructure | Backup/restore procedures, failover testing — see [Disaster Recovery](../../infrastructure/disaster-recovery.md) |
 
 **Exit criteria:** System is auditable, observable, and resilient. Ready for production use.
 
 ### Phase 5: Continuous Enhancement (Ongoing)
 
 - Alternative data integration (sentiment, satellite, web scraping)
-- ML model integration for alpha generation
+- ML model integration for alpha generation — see [Alpha Engine AI/ML path](alpha-engine.md#aiml-integration-path-phase-5)
 - Advanced risk models (Monte Carlo VaR, CVaR)
-- Multi-asset class support (fixed income, derivatives)
 - Real-time P&L attribution (intraday, not just daily)
+- Additional asset class implementations per the [Multi-Asset Class Strategy](#multi-asset-class-strategy) phasing plan
 
 ## Technology Stack Summary
 
@@ -546,3 +735,5 @@ graph TD
 - [Docker Compose Patterns](../../infrastructure/docker-compose-patterns.md) — local development setup
 - [Market Data Simulator](market-data-simulator.md) — local development market data generator
 - [CI/CD Patterns](../../infrastructure/ci-cd-patterns.md) — build and deployment pipeline
+- [Reconciliation](../../patterns/data-access/reconciliation.md) — position and cash reconciliation against external parties
+- [Disaster Recovery & Data Retention](../../infrastructure/disaster-recovery.md) — backup, archival, and recovery procedures

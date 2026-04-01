@@ -110,9 +110,9 @@ This module does not query the OMS for trade details. Instead, it consumes `trad
 
 Cash positions are tracked in their native currency. For reporting and projection purposes, all positions are also converted to the fund's base currency (typically USD) using the latest FX rates. This means the module always stores the native amount and the FX rate used for conversion — never just the converted amount, which would lose information.
 
-### Settlement Convention Lookup
+### Settlement Convention Registry
 
-Different instruments settle on different schedules. US equities are T+1 (since May 2024), European equities are T+2, US Treasuries are T+1, FX spot is T+2. The module maintains a settlement convention table and looks up the correct convention based on instrument type and market.
+Different instruments settle on different schedules. US equities are T+1 (since May 2024), European equities are T+2, US Treasuries are T+1, FX spot is T+2, futures settle daily via variation margin. The module maintains an extensible settlement convention registry that maps `(asset_class, market)` pairs to settlement rules. Adding a new asset class means adding entries to the registry — no code changes to the settlement calculator or ladder builder.
 
 ## Interface Contract
 
@@ -132,14 +132,20 @@ class CashFlowType(StrEnum):
     TRADE_BUY = "trade_buy"
     TRADE_SELL = "trade_sell"
     DIVIDEND = "dividend"
+    COUPON = "coupon"                    # fixed income coupon payments
     MANAGEMENT_FEE = "management_fee"
     PERFORMANCE_FEE = "performance_fee"
     SUBSCRIPTION = "subscription"
     REDEMPTION = "redemption"
-    MARGIN_CALL = "margin_call"
+    MARGIN_CALL = "margin_call"          # futures/swaps variation margin
     MARGIN_RETURN = "margin_return"
     FX_SETTLEMENT = "fx_settlement"
     INTEREST = "interest"
+    SWAP_RESET = "swap_reset"            # periodic swap leg payment
+    OPTION_PREMIUM = "option_premium"    # premium paid/received on option trade
+    OPTION_EXERCISE = "option_exercise"  # cash on exercise/assignment
+    CAPITAL_CALL = "capital_call"        # private fund capital calls
+    DISTRIBUTION = "distribution"        # private fund distributions
     OTHER = "other"
 
 
@@ -265,6 +271,7 @@ class SettlementConvention(StrEnum):
 # Settlement conventions by instrument type and market.
 # US equities moved to T+1 in May 2024; European equities remain T+2.
 SETTLEMENT_RULES: dict[tuple[str, str], SettlementConvention] = {
+    # Equities
     ("equity", "US"): SettlementConvention.T_PLUS_1,
     ("equity", "CA"): SettlementConvention.T_PLUS_1,
     ("equity", "EU"): SettlementConvention.T_PLUS_2,
@@ -272,11 +279,21 @@ SETTLEMENT_RULES: dict[tuple[str, str], SettlementConvention] = {
     ("equity", "JP"): SettlementConvention.T_PLUS_2,
     ("etf", "US"): SettlementConvention.T_PLUS_1,
     ("etf", "EU"): SettlementConvention.T_PLUS_2,
-    ("fixed_income", "US"): SettlementConvention.T_PLUS_1,
+    # Fixed Income
+    ("fixed_income", "US"): SettlementConvention.T_PLUS_1,   # US Treasuries
     ("fixed_income", "EU"): SettlementConvention.T_PLUS_2,
+    ("fixed_income", "GB"): SettlementConvention.T_PLUS_1,
+    # FX
     ("fx_spot", "*"): SettlementConvention.T_PLUS_2,
+    ("fx_forward", "*"): SettlementConvention.T_PLUS_2,       # or per-contract maturity date
+    # Listed Derivatives
     ("option", "US"): SettlementConvention.T_PLUS_1,
-    ("future", "*"): SettlementConvention.T_PLUS_0,   # futures settle daily via margin
+    ("option", "EU"): SettlementConvention.T_PLUS_1,
+    ("future", "*"): SettlementConvention.T_PLUS_0,           # daily margin settlement
+    # OTC Derivatives
+    ("swap", "*"): SettlementConvention.T_PLUS_2,             # per reset schedule in practice
+    # Adding a new asset class: add entries here. No changes to the settlement
+    # calculator or ladder builder — they consume this registry.
 }
 
 
@@ -966,3 +983,4 @@ cash-management
 - [Security Master](security-master.md) — provides instrument metadata for settlement convention lookup
 - [Risk Engine](risk-engine.md) — consumes cash shortfall warnings to adjust liquidity risk assessment
 - [Performance Attribution](performance-attribution.md) — cash drag (uninvested cash) shows up in attribution as a return detractor
+- [System Overview — Multi-Asset Strategy](overview.md#multi-asset-class-strategy) — settlement conventions per asset class

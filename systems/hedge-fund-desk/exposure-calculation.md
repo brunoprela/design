@@ -109,6 +109,91 @@ Positions and prices are held in memory for fast calculation. On startup, the mo
 
 Every position value is converted to the portfolio's base currency before aggregation. FX rates are treated as prices — they arrive on the same `prices.normalized` topic with instrument IDs like `EUR/USD`, `GBP/USD`. The FX rate cache is updated in real time alongside equity prices.
 
+### Asset-Class-Aware Exposure Normalization
+
+Different asset classes contribute to portfolio exposure differently. A naive `quantity × price` calculation is correct for equities but wrong for options (exposure is delta-adjusted), futures (notional value, not margin), and bonds (modified duration × notional for interest rate exposure). The exposure calculator uses an `ExposureNormalizer` protocol:
+
+```python
+# normalizer.py
+
+from typing import Protocol
+from decimal import Decimal
+
+
+class ExposureNormalizer(Protocol):
+    """Converts a position into its effective market exposure in base currency."""
+
+    def normalize(self, position: dict) -> Decimal:
+        """Return the delta-equivalent market exposure for this position."""
+        ...
+
+
+class EquityExposureNormalizer:
+    """Equities/ETFs: exposure = quantity × price × fx_rate."""
+
+    def normalize(self, position: dict) -> Decimal:
+        return (
+            Decimal(str(position["quantity"]))
+            * Decimal(str(position["price"]))
+            * Decimal(str(position.get("fx_rate", 1)))
+        )
+
+
+class OptionExposureNormalizer:
+    """Options: delta-adjusted exposure = contracts × delta × underlying_price × multiplier × fx_rate.
+    
+    A call option with delta 0.5 on 100 shares of a $150 stock contributes
+    $7,500 of effective market exposure, not the $3 option premium × 100.
+    """
+
+    def normalize(self, position: dict) -> Decimal:
+        delta = Decimal(str(position.get("delta", 0)))
+        underlying_price = Decimal(str(position.get("underlying_price", 0)))
+        multiplier = Decimal(str(position.get("contract_multiplier", 100)))
+        quantity = Decimal(str(position["quantity"]))
+        fx_rate = Decimal(str(position.get("fx_rate", 1)))
+        return quantity * delta * underlying_price * multiplier * fx_rate
+
+
+class FutureExposureNormalizer:
+    """Futures: notional exposure = contracts × contract_size × price × fx_rate.
+    
+    Margin posted is NOT the exposure — the exposure is the full notional.
+    """
+
+    def normalize(self, position: dict) -> Decimal:
+        contract_size = Decimal(str(position.get("contract_size", 1)))
+        quantity = Decimal(str(position["quantity"]))
+        price = Decimal(str(position["price"]))
+        fx_rate = Decimal(str(position.get("fx_rate", 1)))
+        return quantity * contract_size * price * fx_rate
+
+
+class FixedIncomeExposureNormalizer:
+    """Bonds: market value exposure = par_held × clean_price / 100 + accrued.
+    
+    For interest rate exposure dimension, use duration × market_value instead.
+    """
+
+    def normalize(self, position: dict) -> Decimal:
+        par_value = Decimal(str(position["quantity"]))  # quantity = par held
+        clean_price = Decimal(str(position["price"]))
+        accrued = Decimal(str(position.get("accrued_interest", 0)))
+        fx_rate = Decimal(str(position.get("fx_rate", 1)))
+        return (par_value * clean_price / Decimal("100") + accrued) * fx_rate
+
+
+EXPOSURE_NORMALIZERS: dict[str, ExposureNormalizer] = {
+    "equity": EquityExposureNormalizer(),
+    "etf": EquityExposureNormalizer(),
+    "option": OptionExposureNormalizer(),
+    "future": FutureExposureNormalizer(),
+    "fixed_income": FixedIncomeExposureNormalizer(),
+}
+```
+
+The `ExposureCalculator._recalculate()` method looks up the normalizer by asset class when building `PositionValue` entries. For positions without a registered normalizer, it falls back to `quantity × price × fx_rate` (the equity default).
+
 ## Interface Contract
 
 ```python
@@ -660,3 +745,4 @@ exposure-calculation
 - [Security Master](security-master.md) — source of instrument attributes (sector, country, type)
 - [Alpha Engine](alpha-engine.md) — consumes exposure data for what-if analysis
 - [Compliance Guardian](compliance-guardian.md) — monitors exposure limits
+- [System Overview — Multi-Asset Strategy](overview.md#multi-asset-class-strategy) — asset class phasing and normalization requirements

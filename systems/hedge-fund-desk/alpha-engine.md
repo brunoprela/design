@@ -811,9 +811,58 @@ alpha-engine
   └── consumed by: order-management, compliance
 ```
 
+## AI/ML Integration Path (Phase 5)
+
+The alpha engine is the natural integration point for ML-driven investment signals. The architecture intentionally separates "expected returns" from "optimization" — the optimizer takes return estimates as input, regardless of whether a human PM or an ML model produced them.
+
+### Signal Sources
+
+| Signal Type | Pattern | Integration Point |
+|---|---|---|
+| **Sentiment scoring** | [Embedding Pipelines](../../patterns/ai-ml/embedding-pipelines.md) | News/filing embeddings → sentiment score per instrument → expected return adjustment |
+| **Return prediction** | [Model Serving](../../patterns/ai-ml/model-serving.md) | ML model (gradient boosting, LSTM) predicts forward returns → feeds into optimizer as `expected_returns` vector |
+| **Research summarization** | [RAG Architecture](../../patterns/ai-ml/rag-architecture.md) | PM asks "what's the bull case for AAPL?" → retrieval over earnings transcripts, analyst reports → LLM synthesis |
+| **Constraint suggestion** | [LLM Gateway](../../patterns/ai-ml/llm-gateway.md) | PM describes intent in natural language → LLM maps to formal constraints (sector limits, beta targets) |
+
+### Architecture Extension
+
+```mermaid
+graph LR
+    subgraph "Signal Generation"
+        EMB[Embedding Pipeline]
+        MODEL[Factor Model]
+        SENT[Sentiment Scorer]
+    end
+
+    subgraph "Alpha Engine"
+        ER[Expected Returns Vector]
+        OPT[Portfolio Optimizer]
+    end
+
+    EMB --> SENT
+    SENT --> ER
+    MODEL --> ER
+    ER --> OPT
+```
+
+### Design Principles for ML Integration
+
+1. **Models are advisory, not authoritative.** ML-generated expected returns feed into the same optimizer as PM-supplied views. The PM always has override authority. Order intents still require approval before execution.
+
+2. **Model outputs are logged as events.** Every signal (sentiment score, predicted return) is published as an event with a model version, input features hash, and confidence interval. This enables backtesting and audit ("why did the system suggest buying TSLA on March 5th?").
+
+3. **Feature store separation.** Raw features (price history, fundamentals, embeddings) live in a [Feature Store](../../data-strategies/feature-stores.md) — a read-optimized store separate from the transactional database. The alpha engine reads features; it does not own them.
+
+4. **Graceful absence.** The alpha engine must function without any ML models deployed. ML integration is additive — the optimizer works with PM-supplied return estimates, model-generated estimates, or a blend. No ML dependency on the critical path.
+
 ## Related Documents
 
 - [Market Data Ingestion](market-data-ingestion.md) — source of prices and historical data for covariance estimation
 - [Exposure Calculation](exposure-calculation.md) — current exposure used in what-if analysis
 - [Compliance Guardian](compliance-guardian.md) — pre-trade checks on order intents before execution
 - [Security Master](security-master.md) — instrument metadata for sector/country constraints
+- [Embedding Pipelines](../../patterns/ai-ml/embedding-pipelines.md) — text-to-vector for sentiment and research
+- [Model Serving](../../patterns/ai-ml/model-serving.md) — inference infrastructure for return prediction models
+- [RAG Architecture](../../patterns/ai-ml/rag-architecture.md) — retrieval-augmented generation for PM research queries
+- [LLM Gateway](../../patterns/ai-ml/llm-gateway.md) — structured access to LLMs for natural-language constraint mapping
+- [Feature Stores](../../data-strategies/feature-stores.md) — read-optimized feature storage for model training and inference

@@ -158,6 +158,79 @@ Schemas change. The rules for evolving event schemas without breaking consumers:
 
 Use Schema Registry (Avro or Protobuf) for Kafka-based events to enforce compatibility rules automatically.
 
+## Event Handler Error Isolation
+
+A single event topic often has multiple subscribers. A price update triggers both a database write and a mark-to-market recalculation. If the database write fails, should the mark-to-market be cancelled? Almost never — yet naive implementations (`asyncio.gather()` without error handling) do exactly this.
+
+### The Problem
+
+```python
+# WRONG — one handler failure cancels all others
+await asyncio.gather(*(h(event) for h in handlers))
+```
+
+If handler 2 raises, `asyncio.gather()` raises immediately, cancelling any handlers that haven't completed. The event is partially processed — some side effects happened, others didn't.
+
+### The Solution: Isolate Each Handler
+
+Each handler runs independently. A failure in one handler is logged and recorded but does not prevent other handlers from executing:
+
+```python
+async def publish(self, topic: str, event: BaseEvent) -> None:
+    handlers = self._handlers.get(topic, [])
+    results = await asyncio.gather(
+        *(self._safe_invoke(h, event) for h in handlers),
+        return_exceptions=True,
+    )
+    for handler, result in zip(handlers, results):
+        if isinstance(result, Exception):
+            logger.error(
+                "event_handler_failed",
+                topic=topic,
+                handler=handler.__qualname__,
+                event_id=event.event_id,
+                error=str(result),
+            )
+
+async def _safe_invoke(
+    self, handler: EventHandler, event: BaseEvent
+) -> None:
+    try:
+        await handler(event)
+    except Exception:
+        raise  # Let gather collect it via return_exceptions=True
+```
+
+### Critical vs. Non-Critical Handlers
+
+Not all handlers are equal. Recording a trade in the event store is critical — if that fails, the trade should not proceed. Updating a cache is not — the cache can be rebuilt.
+
+Apply the [Error Kernel Pattern](error-handling-strategy.md) to event handlers:
+
+| Handler Type | Failure Behavior | Example |
+|---|---|---|
+| **Critical** | Fail the entire operation, propagate to caller | Event store write, position update |
+| **Non-critical** | Log error, continue, retry later | Cache warm, notification, audit enrichment |
+
+The event bus should support handler priority or criticality annotations so that the publish path can distinguish between "this failure means the event was not processed" and "this failure is a degraded side effect."
+
+### Dead Letter Handling (In-Process)
+
+Even before Kafka, the in-process event bus should track failed handler invocations. Failed events should be retryable — either immediately (for transient infrastructure errors) or via a background sweep:
+
+```python
+@dataclass
+class FailedEvent:
+    topic: str
+    event: BaseEvent
+    handler: str
+    error: str
+    timestamp: datetime
+    retry_count: int = 0
+```
+
+This provides observability into handler failures and a path to reprocessing without losing events. When migrating to Kafka, these become dead-letter queue entries.
+
 ## Event Ordering
 
 ### Within a Partition
