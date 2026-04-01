@@ -202,7 +202,7 @@ class SecurityMasterService:
 ### Data Model (PostgreSQL)
 
 ```sql
-CREATE TABLE market_data.instruments (
+CREATE TABLE security_master.instruments (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name                VARCHAR(255) NOT NULL,
     asset_class         VARCHAR(32) NOT NULL,
@@ -219,9 +219,9 @@ CREATE TABLE market_data.instruments (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE market_data.instrument_identifiers (
+CREATE TABLE security_master.instrument_identifiers (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    instrument_id   UUID NOT NULL REFERENCES market_data.instruments(id),
+    instrument_id   UUID NOT NULL REFERENCES security_master.instruments(id),
     identifier_type VARCHAR(32) NOT NULL,
     value           VARCHAR(64) NOT NULL,
     is_primary      BOOLEAN NOT NULL DEFAULT FALSE,
@@ -233,11 +233,11 @@ CREATE TABLE market_data.instrument_identifiers (
     UNIQUE (identifier_type, value, valid_from)
 );
 
-CREATE INDEX ix_identifiers_value ON market_data.instrument_identifiers (value);
-CREATE INDEX ix_identifiers_instrument ON market_data.instrument_identifiers (instrument_id);
+CREATE INDEX ix_sm_identifiers_value ON security_master.instrument_identifiers (value);
+CREATE INDEX ix_sm_identifiers_instrument ON security_master.instrument_identifiers (instrument_id);
 
 -- Full-text search on instrument name
-CREATE INDEX ix_instruments_name_search ON market_data.instruments
+CREATE INDEX ix_sm_instruments_name_search ON security_master.instruments
     USING gin (to_tsvector('english', name));
 ```
 

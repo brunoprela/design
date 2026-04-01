@@ -213,7 +213,8 @@ CREATE TABLE positions.lots (
     acquired_at         TIMESTAMPTZ NOT NULL,
     trade_id            UUID NOT NULL,
 
-    CONSTRAINT positive_quantity CHECK (quantity >= 0)
+    -- Negative quantity represents a short lot
+    CONSTRAINT valid_lot CHECK (quantity != 0)
 );
 
 CREATE INDEX ix_lots_position ON positions.lots (portfolio_id, instrument_id);
@@ -238,7 +239,7 @@ CREATE TABLE positions.daily_pnl (
 # aggregate.py
 
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 from datetime import datetime
 from dataclasses import dataclass, field
 
@@ -309,18 +310,14 @@ class PositionAggregate:
     def _apply_sell(self, event: dict) -> list[dict]:
         qty = Decimal(str(event["data"]["quantity"]))
         price = Decimal(str(event["data"]["price"]))
+        trade_id = UUID(event["data"]["trade_id"])
 
-        if qty > self.quantity:
-            raise InsufficientPositionError(
-                f"Cannot sell {qty}, only holding {self.quantity}"
-            )
-
-        # FIFO lot matching
+        # FIFO lot matching against existing long lots
         remaining = qty
         realized = Decimal(0)
 
         for lot in sorted(self.lots, key=lambda l: l.acquired_at):
-            if remaining <= 0:
+            if remaining <= 0 or lot.quantity <= 0:
                 break
             sold_from_lot = min(remaining, lot.quantity)
             realized += sold_from_lot * (price - lot.price)
@@ -329,6 +326,19 @@ class PositionAggregate:
 
         # Remove exhausted lots
         self.lots = [l for l in self.lots if l.quantity > 0]
+
+        # Short selling: if selling more than held, the remainder opens a
+        # short position. Short sales don't use FIFO — they create a new
+        # "short lot" with negative quantity, tracked at the sale price.
+        if remaining > 0:
+            self.lots.append(PositionLotState(
+                lot_id=UUID(event["data"].get("lot_id", str(uuid4()))),
+                quantity=-remaining,
+                original_quantity=-remaining,
+                price=price,
+                acquired_at=datetime.fromisoformat(event["timestamp"]),
+                trade_id=trade_id,
+            ))
 
         self.quantity -= qty
         self.cost_basis = sum(l.quantity * l.price for l in self.lots)
@@ -493,9 +503,10 @@ class MarkToMarketEngine:
                 unrealized_pnl=new_unrealized,
             )
 
-            # Publish P&L change if material (> $1)
+            # Suppress noise: skip if change < 0.01% of position market value
             pnl_change = new_unrealized - old_unrealized
-            if abs(pnl_change) > Decimal("1"):
+            threshold = abs(new_market_value) * Decimal("0.0001")
+            if abs(pnl_change) > threshold:
                 await self._publisher.publish(
                     topic="pnl.updated",
                     key=f"{position.portfolio_id}:{instrument_id}",

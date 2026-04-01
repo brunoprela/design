@@ -32,6 +32,7 @@ graph LR
 ```python
 import json
 import logging
+from datetime import datetime, timezone
 
 from confluent_kafka import Consumer, Producer
 
@@ -57,7 +58,7 @@ class ResilientConsumer:
             if msg is None or msg.error():
                 continue
 
-            retries = int(msg.headers().get("x-retry-count", b"0")) if msg.headers() else 0
+            retries = int(dict(msg.headers() or []).get("x-retry-count", b"0")) if msg.headers() else 0
 
             try:
                 event = json.loads(msg.value().decode("utf-8"))
@@ -84,7 +85,7 @@ class ResilientConsumer:
             ("x-original-offset", str(msg.offset()).encode()),
             ("x-retry-count", str(retries).encode()),
             ("x-failure-reason", reason.encode()),
-            ("x-failed-at", datetime.utcnow().isoformat().encode()),
+            ("x-failed-at", datetime.now(timezone.utc).isoformat().encode()),
         ]
         self._dlq_producer.produce(
             topic=self._dlq_topic,

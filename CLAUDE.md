@@ -11,7 +11,7 @@ This is a design reference library for modular software systems. It contains arc
 - Every document follows the structure defined in README.md (Context, Design Decisions, Architecture, etc.) but only includes sections that are relevant
 - Documents in `patterns/` are technology-specific but domain-agnostic
 - Documents in `systems/` compose patterns and add domain-specific context
-- Documents in `principles/` are conceptual — no code, focused on reasoning and tradeoffs
+- Documents in `principles/` are conceptual — focused on reasoning and tradeoffs, with minimal code examples where they clarify a design decision
 - Cross-reference related documents using relative links: `[Kafka Topology](../patterns/messaging/kafka-topology.md)`
 
 ## Writing Style

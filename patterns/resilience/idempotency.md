@@ -53,7 +53,7 @@ sequenceDiagram
 # fastapi >= 0.115, sqlalchemy >= 2.0, pydantic >= 2.0
 import hashlib
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Request, Response, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -73,7 +73,7 @@ class IdempotencyRecord(Base):
     request_hash: Mapped[str] = mapped_column(index=False)
     status_code: Mapped[int]
     response_body: Mapped[str]
-    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
     expires_at: Mapped[datetime]
 
 
@@ -134,7 +134,7 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
                 request_hash=request_hash,
                 status_code=response.status_code,
                 response_body=response_body.decode(),
-                expires_at=datetime.utcnow() + IDEMPOTENCY_TTL,
+                expires_at=datetime.now(timezone.utc) + IDEMPOTENCY_TTL,
             )
             session.add(new_record)
             await session.commit()
@@ -167,7 +167,7 @@ For event-driven systems where there is no HTTP request/response, use a deduplic
 
 ```python
 # deduplication.py
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -180,7 +180,7 @@ class ProcessedEvent(Base):
 
     event_id: Mapped[str] = mapped_column(primary_key=True)
     event_type: Mapped[str]
-    processed_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    processed_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
 
 
 async def process_event_idempotently(
@@ -277,6 +277,8 @@ The idempotency contract requires cooperation from the client:
 ```python
 # client.py
 import uuid
+from decimal import Decimal
+
 import httpx
 
 

@@ -54,7 +54,7 @@ class Money(BaseModel):
 ```python
 # shared/events.py — base event types
 
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -62,7 +62,7 @@ from pydantic import BaseModel, Field
 
 class EventMetadata(BaseModel):
     event_id: UUID = Field(default_factory=uuid4)
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     correlation_id: UUID | None = None
     causation_id: UUID | None = None
 

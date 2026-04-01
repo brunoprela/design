@@ -58,7 +58,7 @@ class Repository(Protocol[T]):
 ```python
 # models.py
 
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -82,7 +82,7 @@ class TradeRecord(Base):
     price: Mapped[Decimal] = mapped_column(Numeric(18, 8))
     currency: Mapped[str] = mapped_column(String(3))
     executed_at: Mapped[datetime]
-    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
 ```
 
 ### Repository Implementation
@@ -180,8 +180,11 @@ class UnitOfWork:
 
     async def __aenter__(self) -> "UnitOfWork":
         self._session = self._session_factory()
-        self.trades = PostgresTradeRepository(self._session)
-        self.positions = PostgresPositionRepository(self._session)
+        # Wrap the session in a lambda so repositories receive a factory
+        # that always returns this transaction's session.
+        scoped_factory = lambda: self._session  # noqa: E731
+        self.trades = PostgresTradeRepository(scoped_factory)
+        self.positions = PostgresPositionRepository(scoped_factory)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:

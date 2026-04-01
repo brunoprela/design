@@ -39,6 +39,9 @@ from typing import Protocol
 from datetime import datetime
 from decimal import Decimal
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
 
 # The domain defines what it needs
 class PriceRepository(Protocol):
@@ -162,6 +165,10 @@ No dependency injection framework needed. Constructor injection with plain Pytho
 Because the domain depends on Protocols, not implementations, testing is straightforward:
 
 ```python
+from datetime import datetime
+from decimal import Decimal
+
+
 class FakePriceRepository:
     """In-memory implementation for testing."""
 

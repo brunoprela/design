@@ -37,7 +37,7 @@ When the Bloomberg market data feed fails, the system falls back to the last kno
 # market_data_service.py
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from pydantic import BaseModel
@@ -102,7 +102,7 @@ class MarketDataService:
             )
 
         quote = PriceQuote.model_validate_json(cached)
-        age = datetime.utcnow() - quote.timestamp
+        age = datetime.now(timezone.utc) - quote.timestamp
 
         if age > self._policy.reject_after:
             raise LookupError(
@@ -144,6 +144,8 @@ graph LR
 ```python
 # search_service.py
 from enum import Enum
+
+from sqlalchemy import text
 
 
 class SearchMode(Enum):

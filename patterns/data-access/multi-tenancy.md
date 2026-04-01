@@ -48,7 +48,12 @@ The application sets `app.current_tenant` at the start of each request:
 class TenantMiddleware:
     async def __call__(self, request: Request, call_next):
         tenant_id = extract_tenant_from_token(request)
-        # Set tenant context for RLS policies
+        # Set tenant context for RLS policies.
+        # IMPORTANT: In production, SET LOCAL must run on the same database
+        # session/connection used by the request handler — otherwise the
+        # setting is lost. Prefer a SQLAlchemy session event listener
+        # (e.g., after_begin) or ensure the middleware and request handler
+        # share the same session via dependency injection.
         async with db.session() as session:
             await session.execute(
                 text("SET LOCAL app.current_tenant = :tid"),

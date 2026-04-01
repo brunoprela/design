@@ -6,6 +6,8 @@ A modular system depends on multiple infrastructure services — PostgreSQL, Tim
 
 Docker Compose provides a single `docker compose up` that starts the entire local environment identically on every machine.
 
+> **Resource Requirements**: The `core` profile needs ~2GB RAM. The `full` profile (all services) needs ~10GB. Allocate at least 12GB to Docker Desktop (Settings → Resources → Memory).
+
 ## Design Decisions
 
 ### Profiles for Selective Startup
@@ -26,7 +28,8 @@ services:
       POSTGRES_PASSWORD: dev
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./scripts/extensions.sql:/docker-entrypoint-initdb.d/02-extensions.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app"]
       interval: 5s
@@ -174,6 +177,28 @@ services:
     volumes:
       - ./policy:/policies
 
+  # === Dev Tools (profile: dev-tools) ===
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    profiles: ["dev-tools"]
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+    depends_on:
+      - kafka
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    profiles: ["dev-tools"]
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@local.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+
 volumes:
   postgres_data:
 ```
@@ -204,27 +229,29 @@ docker compose --profile full down -v
 
 ```sql
 -- scripts/init-db.sql
+-- Runs once on first container start
 
--- Create schemas for each bounded context
+-- Bounded context schemas
 CREATE SCHEMA IF NOT EXISTS market_data;
 CREATE SCHEMA IF NOT EXISTS positions;
 CREATE SCHEMA IF NOT EXISTS risk;
 CREATE SCHEMA IF NOT EXISTS compliance;
 CREATE SCHEMA IF NOT EXISTS audit;
+CREATE SCHEMA IF NOT EXISTS read_models;
 
--- Enable extensions
-CREATE EXTENSION IF NOT EXISTS timescaledb;
-CREATE EXTENSION IF NOT EXISTS vector;  -- pgvector for embeddings
+-- OpenFGA needs its own database
+SELECT 'CREATE DATABASE openfga'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'openfga')\gexec
+```
+
+```sql
+-- scripts/extensions.sql
+
+CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+CREATE EXTENSION IF NOT EXISTS vector;          -- pgvector
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
--- Create OpenFGA database
-CREATE DATABASE openfga;
-
--- Create a read-only user for analytics
-CREATE ROLE analyst WITH LOGIN PASSWORD 'dev';
-GRANT USAGE ON SCHEMA market_data, positions, risk TO analyst;
-ALTER DEFAULT PRIVILEGES IN SCHEMA market_data, positions, risk
-    GRANT SELECT ON TABLES TO analyst;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;         -- trigram similarity for fuzzy search
+CREATE EXTENSION IF NOT EXISTS btree_gist;      -- exclusion constraints
 ```
 
 ### Health Check Dependencies
@@ -279,6 +306,7 @@ services:
 
 ## Related Documents
 
+- [Getting Started](getting-started.md) — step-by-step onboarding guide
 - [Local Kafka Cluster](local-kafka-cluster.md) — Kafka-specific local setup
 - [Local Postgres TimescaleDB](local-postgres-timescale.md) — database-specific local setup
 - [Secret Management](secret-management.md) — managing credentials beyond `.env`

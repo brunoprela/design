@@ -49,7 +49,6 @@ graph TD
     subgraph "Kafka Topics"
         T1[prices.raw]
         T2[prices.normalized]
-        T3[corporate-actions.applied]
     end
 
     subgraph "Consumers"
@@ -276,7 +275,7 @@ class MarketDataIngestionService:
 # validator.py
 
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 
 
@@ -314,7 +313,7 @@ class PriceValidator:
                 errors.append(f"Wide spread: {spread_pct:.2%} of mid")
 
         # Timestamp must not be in the future or too stale
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if price.timestamp > now + timedelta(seconds=30):
             errors.append(f"Future timestamp: {price.timestamp}")
         if now - price.timestamp > self._max_staleness:
@@ -397,8 +396,9 @@ SELECT add_continuous_aggregate_policy('market_data.ohlcv_1d',
 | Topic | Key | Event | Consumers |
 |---|---|---|---|
 | `prices.normalized` | `instrument_id` | `price.updated` | Positions, Risk, Alpha |
-| `corporate-actions.applied` | `instrument_id` | `corporate_action.split`, `corporate_action.dividend` | Positions, Security Master |
 | `market-data.status` | `source` | `feed.connected`, `feed.disconnected`, `feed.stale` | Monitoring, Alerting |
+
+> **Note:** Corporate actions (`corporate-actions.announced`) are published by the [Security Master](security-master.md) module, not Market Data.
 
 ### Feed Health Monitoring
 
@@ -417,7 +417,7 @@ class FeedHealthMonitor:
 
         for instrument_id in instruments:
             latest = await self._repository.get_latest_timestamp(instrument_id)
-            age = datetime.utcnow() - latest
+            age = datetime.now(timezone.utc) - latest
             if age > timedelta(minutes=5):
                 stale.append(FeedStatus(
                     instrument_id=instrument_id,
@@ -478,7 +478,7 @@ class FeedHealthMonitor:
 market-data-ingestion
   ├── depends on: shared kernel (types, events)
   ├── depends on: nothing else (leaf module)
-  ├── publishes: prices.normalized, corporate-actions.applied, market-data.status
+  ├── publishes: prices.normalized, market-data.status
   └── consumed by: positions, risk, alpha-engine, compliance
 ```
 

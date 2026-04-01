@@ -204,7 +204,7 @@ sequenceDiagram
     SM--)COMP: corporate-actions.announced
 
     POS->>POS: Apply split to position aggregate
-    Note over POS: quantity × 4, price ÷ 4, cost basis unchanged
+    Note over POS: quantity × 4, per-share cost ÷ 4, total cost basis unchanged
     POS--)COMP: positions.changed
     COMP->>COMP: Re-evaluate concentration limits
 ```
@@ -215,20 +215,27 @@ sequenceDiagram
 |---|---|---|---|---|
 | `prices.normalized` | Market Data | Positions, Risk, Exposure, Alpha | `instrument_id` | 7 days |
 | `instruments.updated` | Security Master | Market Data, Positions | `instrument_id` | 30 days |
-| `corporate-actions.announced` | Security Master | Positions, Compliance | `instrument_id` | 90 days |
-| `trades.executed` | Order Management | Positions, Cash, Audit | `portfolio_id` | 30 days |
+| `corporate-actions.announced` | Security Master | Positions, Compliance, Cash Management | `instrument_id` | 90 days |
+| `trades.executed` | Order Management | Positions, Cash, Risk Engine, Exposure, Audit | `instrument_id` ¹ | 30 days |
 | `trades.pending` | Order Management | Compliance | `portfolio_id` | 7 days |
 | `trades.approved` | Compliance | Order Management | `portfolio_id` | 7 days |
-| `trades.rejected` | Compliance | Order Management, Audit | `portfolio_id` | 30 days |
+| `trades.rejected` | Compliance | Order Management, Risk Engine, Exposure, Audit | `portfolio_id` | 30 days |
 | `positions.changed` | Positions | Risk, Exposure, Compliance, Audit | `portfolio_id:instrument_id` | 30 days |
 | `pnl.updated` | Positions | Performance Attribution, Audit | `portfolio_id` | 30 days |
 | `order-intents.generated` | Alpha Engine | Order Management | `portfolio_id` | 7 days |
 | `exposures.updated` | Exposure | Alpha, Risk | `portfolio_id` | 7 days |
-| `risk.calculated` | Risk | Alpha | `portfolio_id` | 30 days |
+| `risk.calculated` | Risk Engine | Alpha, Compliance | `portfolio_id` | 30 days |
 | `compliance.violations` | Compliance | Audit | `portfolio_id` | 90 days |
+| `orders.created` | OMS | Audit | `portfolio_id` | 30 days |
+| `orders.filled` | OMS | Positions, Cash Management, Audit | `portfolio_id` | 30 days |
+| `risk.breach` | Risk Engine | Compliance, Alerting | `portfolio_id` | 90 days |
 | `cash.projected` | Cash Management | — | `portfolio_id` | 7 days |
+| `cash.settlement_due` | Cash Management | Operations, Alerting | `portfolio_id` | 30 days |
+| `cash.balance_warning` | Cash Management | Risk, Alerting | `portfolio_id` | 30 days |
 | `attribution.calculated` | Performance | — | `portfolio_id` | 30 days |
 | `market-data.status` | Market Data | Monitoring | `source` | 7 days |
+
+> ¹ `trades.executed` uses `instrument_id` as partition key — this ensures all fills for the same instrument are ordered, matching the OMS code that publishes to this topic.
 
 ## Module Dependency Graph
 
@@ -303,31 +310,31 @@ depends_on = ["shared", "modules.market_data"]
 
 [[tool.tach.modules]]
 path = "modules.order_management"
-depends_on = ["shared", "modules.compliance"]
+depends_on = ["shared", "modules.compliance", "modules.security_master"]
 
 [[tool.tach.modules]]
 path = "modules.exposure"
-depends_on = ["shared", "modules.positions", "modules.market_data"]
+depends_on = ["shared", "modules.positions", "modules.market_data", "modules.security_master"]
 
 [[tool.tach.modules]]
 path = "modules.risk"
-depends_on = ["shared", "modules.positions", "modules.market_data"]
+depends_on = ["shared", "modules.positions", "modules.market_data", "modules.security_master"]
 
 [[tool.tach.modules]]
 path = "modules.alpha"
-depends_on = ["shared", "modules.positions", "modules.market_data", "modules.risk"]
+depends_on = ["shared", "modules.positions", "modules.market_data", "modules.risk", "modules.exposure", "modules.security_master"]
 
 [[tool.tach.modules]]
 path = "modules.compliance"
-depends_on = ["shared", "modules.positions"]
+depends_on = ["shared", "modules.positions", "modules.market_data", "modules.security_master"]
 
 [[tool.tach.modules]]
 path = "modules.performance"
-depends_on = ["shared", "modules.positions", "modules.market_data"]
+depends_on = ["shared", "modules.positions", "modules.market_data", "modules.risk"]
 
 [[tool.tach.modules]]
 path = "modules.cash"
-depends_on = ["shared"]
+depends_on = ["shared", "modules.security_master", "modules.market_data"]
 
 [[tool.tach.modules]]
 path = "modules.audit"
@@ -342,6 +349,7 @@ depends_on = ["shared"]
 graph TD
     subgraph "PostgreSQL (single instance)"
         S_MD[market_data schema]
+        S_SM[security_master schema]
         S_POS[positions schema]
         S_RISK[risk schema]
         S_COMP[compliance schema]
@@ -367,7 +375,7 @@ graph TD
     end
 
     subgraph "Kafka"
-        TOPICS[15 event topics]
+        TOPICS[20 event topics]
     end
 ```
 
@@ -534,5 +542,7 @@ graph TD
 - [Event-Driven Architecture](../../principles/event-driven-architecture.md) — Kafka as central nervous system
 - [CQRS & Event Sourcing](../../principles/cqrs-event-sourcing.md) — position keeping strategy
 - [Bounded Contexts](../../principles/bounded-contexts.md) — how module boundaries were drawn
+- [EOD Processing](eod-processing.md) — end-of-day batch processing workflow
 - [Docker Compose Patterns](../../infrastructure/docker-compose-patterns.md) — local development setup
+- [Market Data Simulator](market-data-simulator.md) — local development market data generator
 - [CI/CD Patterns](../../infrastructure/ci-cd-patterns.md) — build and deployment pipeline

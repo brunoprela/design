@@ -117,6 +117,8 @@ class KafkaEventPublisher:
         key: str,
         value: dict,
     ) -> None:
+        # Note: produce() is non-blocking (buffers locally), flush() is blocking.
+        # This async method is safe because produce() only enqueues to an internal buffer.
         self._producer.produce(
             topic=topic,
             key=key.encode("utf-8"),
@@ -162,6 +164,10 @@ class KafkaEventConsumer:
     async def consume(self, handler) -> None:
         """Main consumption loop."""
         while True:
+            # Note: poll() is a synchronous call from confluent-kafka's C library.
+            # With timeout=1.0 it blocks the event loop for up to 1 second.
+            # For high-throughput async applications, consider running poll() in
+            # a thread executor via asyncio.to_thread() or loop.run_in_executor().
             msg = self._consumer.poll(timeout=1.0)
             if msg is None:
                 continue

@@ -26,6 +26,7 @@ The domain defines what it needs via a Protocol. Each vendor gets an adapter tha
 
 ```python
 # interface.py — what the domain needs
+from collections.abc import AsyncIterator
 from typing import Protocol
 from datetime import datetime
 from decimal import Decimal
@@ -134,7 +135,7 @@ class RateLimiter:
 
     async def acquire(self) -> None:
         await self._semaphore.acquire()
-        asyncio.get_event_loop().call_later(1.0, self._semaphore.release)
+        asyncio.get_running_loop().call_later(1.0, self._semaphore.release)
 
 
 class BloombergAdapter:

@@ -245,6 +245,7 @@ class RiskEngineReader(Protocol):
 # calculators/historical_var.py
 
 import numpy as np
+import pandas as pd
 from decimal import Decimal
 from datetime import date
 from uuid import UUID
@@ -308,9 +309,13 @@ class HistoricalVaRCalculator:
         # Simulate portfolio returns: each row is one historical scenario
         portfolio_returns = returns_matrix @ weight_vector
 
-        # Scale to holding period using square-root-of-time rule
         if holding_period_days > 1:
-            portfolio_returns = portfolio_returns * np.sqrt(holding_period_days)
+            # Use overlapping multi-day returns instead of sqrt(T) scaling.
+            # sqrt(T) scaling assumes i.i.d. normal returns, which defeats
+            # the purpose of historical simulation (capturing fat tails).
+            portfolio_returns = pd.Series(portfolio_returns).rolling(
+                window=holding_period_days
+            ).sum().dropna().values
 
         # Sort returns ascending (worst losses first)
         sorted_returns = np.sort(portfolio_returns)
@@ -346,12 +351,49 @@ class HistoricalVaRCalculator:
         returns_matrix: np.ndarray,
         nav: Decimal,
         confidence_level: float = 0.95,
+    ) -> dict[str, Decimal]:
+        """
+        Component VaR using Euler decomposition. Sum of components = total VaR.
+
+        marginal_var_i = partial VaR / partial w_i
+        component_var_i = w_i * marginal_var_i
+
+        The Euler decomposition guarantees that component VaRs sum to total
+        portfolio VaR, making it suitable for risk attribution.
+        """
+        instrument_ids = list(weights.keys())
+        weight_vector = np.array([weights[iid] for iid in instrument_ids])
+
+        portfolio_returns = returns_matrix @ weight_vector
+        sorted_indices = np.argsort(portfolio_returns)
+        percentile_index = int((1 - confidence_level) * len(portfolio_returns))
+        var_index = sorted_indices[percentile_index]
+
+        total_var = abs(portfolio_returns[var_index])
+
+        # Marginal VaR: the return of each instrument on the VaR scenario day
+        # Component VaR_i = w_i * R_i(t*) where t* is the VaR scenario
+        var_scenario_returns = returns_matrix[var_index, :]
+
+        contributions = {}
+        for i, iid in enumerate(instrument_ids):
+            component = abs(weight_vector[i] * var_scenario_returns[i]) * nav
+            contributions[iid] = Decimal(str(round(float(component), 2)))
+
+        return contributions
+
+    def calculate_incremental_var(
+        self,
+        weights: dict[str, float],
+        returns_matrix: np.ndarray,
+        nav: Decimal,
+        confidence_level: float = 0.95,
     ) -> list[dict]:
         """
-        Component VaR: how much each position contributes to total portfolio VaR.
+        Incremental VaR: how much portfolio VaR changes if a position is removed.
 
-        Uses the marginal contribution approach: for each position, compute how
-        portfolio VaR changes if that position is removed.
+        Unlike component VaR, incremental VaR does NOT sum to total VaR.
+        It answers: "what would happen to my risk if I exited this position?"
         """
         instrument_ids = list(weights.keys())
         weight_vector = np.array([weights[iid] for iid in instrument_ids])
@@ -375,11 +417,11 @@ class HistoricalVaRCalculator:
             reduced_sorted = np.sort(reduced_returns)
             reduced_var = abs(reduced_sorted[percentile_index])
 
-            component = total_var - reduced_var
+            incremental = total_var - reduced_var
             contributions.append({
                 "instrument_id": iid,
-                "component_var": Decimal(str(abs(component))) * nav,
-                "pct_of_total_var": Decimal(str(component / total_var)) if total_var > 0 else Decimal("0"),
+                "incremental_var": Decimal(str(abs(incremental))) * nav,
+                "pct_of_total_var": Decimal(str(incremental / total_var)) if total_var > 0 else Decimal("0"),
                 "standalone_var": Decimal(str(abs(
                     np.sort(returns_matrix[:, i] * weights[iid])[percentile_index]
                 ))) * nav,
@@ -432,7 +474,9 @@ class ParametricVaRCalculator:
         results = []
         for cl in confidence_levels:
             z_score = stats.norm.ppf(cl)
-            var_pct = z_score * portfolio_vol
+            # VaR is reported as a positive number representing a loss,
+            # consistent with historical VaR sign convention.
+            var_pct = abs(z_score * portfolio_vol)
             var_amount = Decimal(str(var_pct)) * nav
 
             results.append({
@@ -777,7 +821,7 @@ class FactorModelCalculator:
 # service.py
 
 import numpy as np
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from uuid import UUID
 
@@ -882,7 +926,7 @@ class RiskOrchestrator:
         snapshot = RiskSnapshot(
             portfolio_id=portfolio_id,
             as_of_date=as_of_date,
-            calculated_at=datetime.utcnow(),
+            calculated_at=datetime.now(timezone.utc),
             nav=nav,
             var_results=hist_var_results + param_var_results,
             stress_results=stress_results,
@@ -900,7 +944,7 @@ class RiskOrchestrator:
             event={
                 "event_type": "risk.snapshot_calculated",
                 "event_id": f"risk-{portfolio_id}-{as_of_date.isoformat()}",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "data": {
                     "portfolio_id": str(portfolio_id),
                     "as_of_date": as_of_date.isoformat(),

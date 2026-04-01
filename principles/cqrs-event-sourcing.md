@@ -131,6 +131,8 @@ Key properties of the event store:
 ### Aggregate Reconstruction
 
 ```python
+from datetime import datetime
+from decimal import Decimal
 from typing import Protocol
 
 

@@ -4,7 +4,7 @@ A design reference library for modular software systems. Each document captures 
 
 ## Philosophy
 
-**Patterns are universal, systems are specific.** Reusable patterns (CQRS, event sourcing, RBAC, data pipelines) live independently. Concrete system designs (hedge fund desk, FDE data platform, LLM authorization) compose those patterns. Adding a new system means assembling existing building blocks with domain-specific glue.
+**Patterns are universal, systems are specific.** Reusable patterns (CQRS, event sourcing, RBAC, data pipelines) live independently. Concrete system designs compose those patterns with domain-specific glue. Adding a new system means assembling existing building blocks — the patterns don't change, only the wiring does.
 
 Everything here is designed to be **developed and run locally** — no cloud accounts required.
 
@@ -27,9 +27,7 @@ design/
 ├── data-strategies/     Cross-cutting data architecture
 ├── infrastructure/      Local dev and operational patterns
 └── systems/             Concrete system designs
-    ├── hedge-fund-desk/ PM desk platform (market data, positions, risk, compliance)
-    ├── fde-data-platform/ Forward-deployed engineering data platform
-    └── llm-platform/    LLM-powered application with fine-grained authorization
+    └── hedge-fund-desk/ PM desk platform (market data, positions, risk, compliance)
 ```
 
 ## How to Read This Repository
@@ -61,10 +59,10 @@ systems/hedge-fund-desk/position-keeping.md
   → patterns/messaging/kafka-topology.md
   → patterns/resilience/idempotency.md
 
-systems/llm-platform/openfga-document-access.md
-  → patterns/authorization/openfga-modeling.md
-  → patterns/ai-ml/rag-architecture.md
-  → patterns/data-processing/embedding-pipelines.md
+systems/hedge-fund-desk/risk-engine.md
+  → principles/cqrs-event-sourcing.md
+  → patterns/resilience/circuit-breakers.md
+  → patterns/observability/metrics-design.md
 ```
 
 ## Tech Stack
