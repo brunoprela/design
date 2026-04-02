@@ -58,6 +58,100 @@ type document
 
 This reads as: a `portfolio` has `owner` (a team), `viewer` and `editor` relations. `can_view` is granted if the user is a viewer, editor, or member of the owning team.
 
+### Type-Safe Resource Registry
+
+A common problem: the Python code and the JSON authorization model can drift. A developer adds a new relation in the JSON model but forgets to update the Python code, or vice versa. This drift is silent until a user hits a broken access check at runtime.
+
+The solution is a type-safe resource registry with startup validation. Each resource type is declared in Python with its checkable relations, and the application validates these declarations against the JSON model on every startup.
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ResourceType:
+    """Declaration of an FGA object type and its checkable relations."""
+    name: str
+    relations: frozenset[str]
+
+    def relation(self, name: str) -> "ResourceRelation":
+        """Return a validated (type, relation) pair."""
+        if name not in self.relations:
+            raise ValueError(
+                f"Unknown relation '{name}' for type '{self.name}'. "
+                f"Valid: {sorted(self.relations)}"
+            )
+        return ResourceRelation(resource_type=self, relation=name)
+
+
+@dataclass(frozen=True)
+class ResourceRelation:
+    """A bound (resource_type, relation) pair passed to require_access."""
+    resource_type: ResourceType
+    relation: str
+
+
+_resource_registry: dict[str, ResourceType] = {}
+
+
+def register_resource_type(rt: ResourceType) -> ResourceType:
+    """Register a resource type. Returns it for assignment convenience."""
+    _resource_registry[rt.name] = rt
+    return rt
+```
+
+Resource declarations live in a single file, imported at startup:
+
+```python
+# fga_resources.py — imported during app startup to trigger registration
+
+Portfolio = register_resource_type(ResourceType(
+    name="portfolio",
+    relations=frozenset({"can_view", "can_trade", "can_manage"}),
+))
+
+Fund = register_resource_type(ResourceType(
+    name="fund",
+    relations=frozenset({"member", "admin"}),
+))
+```
+
+### Startup Validation
+
+On startup, after loading the JSON authorization model, the application validates that every registered Python resource type and relation exists in the model. This catches drift immediately:
+
+```python
+def validate_resource_registry(model_json: dict) -> None:
+    """Validate Python declarations against the FGA model JSON.
+
+    Called during app startup. Raises ValueError with a clear
+    message if any declared type or relation is missing.
+    Does NOT check the reverse — JSON types not registered in
+    Python are fine (e.g., the 'user' type).
+    """
+    json_types: dict[str, set[str]] = {}
+    for td in model_json.get("type_definitions", []):
+        json_types[td["type"]] = set(td.get("relations", {}).keys())
+
+    errors: list[str] = []
+    for rt_name, rt in _resource_registry.items():
+        if rt_name not in json_types:
+            errors.append(f"ResourceType '{rt_name}' not found in FGA model")
+            continue
+        missing = rt.relations - json_types[rt_name]
+        if missing:
+            errors.append(
+                f"ResourceType '{rt_name}' declares relations "
+                f"{sorted(missing)} not in FGA model"
+            )
+
+    if errors:
+        raise ValueError(
+            "FGA resource registry / model mismatch:\n"
+            + "\n".join(f"  - {e}" for e in errors)
+        )
+```
+
 ### Writing Relationship Tuples
 
 When a user joins a team or a portfolio is created, write the relationship:
@@ -117,47 +211,85 @@ class AuthorizationService:
         return response.allowed
 ```
 
-### FastAPI Integration
+### Generic FastAPI Dependency
+
+Rather than writing a `require_portfolio_access()` dependency for each resource type, a generic `require_access` dependency works with any registered resource type. This eliminates boilerplate when adding new resource types:
 
 ```python
-from fastapi import Depends, HTTPException
+from enum import StrEnum
+from fastapi import Depends, HTTPException, Request
 
 
-def require_relation(relation: str, object_type: str, id_param: str = "portfolio_id"):
-    """FastAPI dependency for OpenFGA authorization checks."""
-    async def check(
+class ParamSource(StrEnum):
+    PATH = "path"
+    BODY = "body"
+    QUERY = "query"
+
+
+def require_access(
+    resource_relation: ResourceRelation,
+    *,
+    param: str | None = None,
+    source: ParamSource = ParamSource.PATH,
+):
+    """Generic FastAPI dependency for FGA access checks.
+
+    Extracts the resource ID from the request (path, body, or query),
+    builds the FGA object reference, and checks the relation.
+    Param defaults to "{type_name}_id" (e.g., "portfolio_id").
+    """
+    param_name = param or f"{resource_relation.resource_type.name}_id"
+
+    async def _check(
         request: Request,
-        user: CurrentUser = Depends(get_current_user),
-        auth: AuthorizationService = Depends(get_auth_service),
-    ):
-        object_id = request.path_params.get(id_param)
-        allowed = await auth.check(
-            user_id=user.sub,
-            relation=relation,
-            object=f"{object_type}:{object_id}",
+        ctx: RequestContext = Depends(get_actor_context),
+        fga: FGAClient = Depends(_get_fga),
+    ) -> None:
+        resource_id = await _extract_resource_id(request, param_name, source)
+        allowed = await fga.check(
+            user=f"user:{ctx.actor_id}",
+            relation=resource_relation.relation,
+            object=f"{resource_relation.resource_type.name}:{resource_id}",
         )
         if not allowed:
             raise HTTPException(status_code=403, detail="Access denied")
-        return user
-    return Depends(check)
 
+    return Depends(_check)
+```
 
-@router.get("/portfolios/{portfolio_id}")
-async def get_portfolio(
-    portfolio_id: str,
-    user=require_relation("can_view", "portfolio"),
-):
+Usage in routes — note how both RBAC permission and FGA relation are composed:
+
+```python
+@router.get("/{portfolio_id}/positions")
+async def list_positions(
+    portfolio_id: UUID,
+    ctx: RequestContext = require_permission(Permission.POSITIONS_READ),
+    _access: None = require_access(Portfolio.relation("can_view")),
+) -> list[Position]:
     ...
 
 
-@router.post("/portfolios/{portfolio_id}/trades")
-async def create_trade(
-    portfolio_id: str,
+@router.post("/trades", status_code=201)
+async def execute_trade(
     request: TradeRequest,
-    user=require_relation("can_trade", "portfolio"),
-):
+    ctx: RequestContext = require_permission(Permission.TRADES_EXECUTE),
+    _access: None = require_access(
+        Portfolio.relation("can_trade"),
+        source=ParamSource.BODY,
+    ),
+) -> Position:
     ...
 ```
+
+### Adding a New Resource Type
+
+With the generic system, adding FGA protection for a new resource type is a 3-step process:
+
+1. **JSON model** — add the type definition with relations
+2. **Resource declaration** — `Strategy = register_resource_type(ResourceType(name="strategy", relations=frozenset({...})))`
+3. **Route** — `_access: None = require_access(Strategy.relation("can_view"))`
+
+Mismatches are caught at startup. No new dependency functions, no new enums.
 
 ### List Filtering
 
@@ -182,19 +314,62 @@ OpenFGA runs locally via Docker:
 
 ```yaml
 services:
+  openfga-migrate:
+    image: openfga/openfga:latest
+    command: migrate
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: "postgres://minihedge:minihedge@postgres:5432/minihedge"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   openfga:
     image: openfga/openfga:latest
-    ports:
-      - "8080:8080"   # HTTP API
-      - "8081:8081"   # gRPC
-      - "3000:3000"   # Playground UI
     command: run
     environment:
       OPENFGA_DATASTORE_ENGINE: postgres
-      OPENFGA_DATASTORE_URI: postgres://openfga:dev@postgres:5432/openfga
+      OPENFGA_DATASTORE_URI: "postgres://minihedge:minihedge@postgres:5432/minihedge"
+      OPENFGA_PLAYGROUND_ENABLED: "true"
+    ports:
+      - "8080:8080"   # HTTP API
+      - "3000:3000"   # Playground UI
+    depends_on:
+      openfga-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=localhost:8081"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 ```
 
 The playground at `localhost:3000` lets you visually test authorization models and relationship tuples.
+
+**Note:** The OpenFGA Docker image does not include `curl` or `wget`. Use `grpc_health_probe` (included in the image) for healthchecks.
+
+### SDK Gotchas
+
+When writing tuples idempotently (e.g., during seeding), use the `ConflictOptions` wrapper — not a bare `on_duplicate_writes` key:
+
+```python
+from openfga_sdk.client.models import (
+    ClientWriteRequest,
+    ClientWriteRequestOnDuplicateWrites,
+    ConflictOptions,
+)
+
+await client.write(
+    body=ClientWriteRequest(writes=tuples),
+    options={
+        "conflict": ConflictOptions(
+            on_duplicate_writes=ClientWriteRequestOnDuplicateWrites.IGNORE,
+        ),
+    },
+)
+```
+
+The enum value is `IGNORE`, not `SKIP`.
 
 ## Failure Modes
 
@@ -204,9 +379,10 @@ The playground at `localhost:3000` lets you visually test authorization models a
 | Stale relationships | User removed from team but tuple not deleted | Sync tuples on role changes, periodic reconciliation |
 | Performance on list operations | Large number of objects | Use OpenFGA's contextual tuples, cache list results with short TTL |
 | Model too permissive | Incorrect relation composition | Test model with assertions before deploying |
+| Python/model drift | Developer adds relation in one but not the other | Startup validation via `validate_resource_registry()` |
 
 ## Related Documents
 
 - [OpenFGA for LLM Permissions](openfga-llm-permissions.md) — applying ReBAC to RAG and LLM access
-- [Authorization RBAC](../api/authorization-rbac.md) — coarse-grained role checks
+- [Authorization RBAC](../api/authorization-rbac.md) — coarse-grained role checks and actor context
 - [Policy as Code](policy-as-code.md) — OPA/Cedar for policy-based decisions

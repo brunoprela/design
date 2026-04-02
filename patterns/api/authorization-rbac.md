@@ -1,4 +1,4 @@
-# Authorization — RBAC
+# Authorization — RBAC & Actor Context
 
 ## Context & Problem
 
@@ -10,10 +10,122 @@ For fine-grained, relationship-based access control (e.g., "user X can see docum
 
 ## Design Decisions
 
+### Actor Context — Who Is Making This Request?
+
+Before checking permissions, you need to know *who* is acting. In a multi-tenant system with multiple actor types (human users, API keys, LLM agents), every request carries an **actor context** that answers:
+
+- **Who** — actor ID (user UUID, API key ID, agent ID)
+- **What kind** — actor type (user, apikey, agent, system)
+- **Where** — which fund/tenant they're operating in
+- **What they can do** — roles and resolved permissions
+- **On whose behalf** — delegation chain (for agent tokens)
+
+```python
+from contextvars import ContextVar
+from enum import StrEnum
+from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class ActorType(StrEnum):
+    USER = "user"
+    API_KEY = "apikey"
+    AGENT = "agent"
+    SYSTEM = "system"
+
+
+class RequestContext(BaseModel):
+    """Immutable identity + authorization context for a single request."""
+
+    model_config = ConfigDict(frozen=True)
+
+    actor_id: str
+    actor_type: ActorType
+    fund_slug: str
+    roles: frozenset[str] = frozenset()
+    permissions: frozenset[str] = frozenset()
+    request_id: str = Field(default_factory=lambda: str(uuid4()))
+    delegated_by: str | None = None
+
+
+_current_context: ContextVar[RequestContext] = ContextVar("request_context")
+```
+
+**Why `contextvars`, not dependency injection?** `contextvars` is async-safe and scoped to the current task — concurrent requests never leak context. It's accessible from any layer (service, handler, repository) without threading the context through every function signature. FastAPI dependencies set the context; downstream code reads it.
+
+### Context Propagation — Strict vs. System Fallback
+
+A critical safety decision: what happens when code reads the request context outside of a request (e.g., an event handler triggered by the simulator)?
+
+```python
+def get_request_context() -> RequestContext:
+    """Get the current request context. Raises if no context is set.
+
+    Use get_request_context_or_system() for code paths that
+    legitimately run outside a request (e.g. event handlers).
+    """
+    try:
+        return _current_context.get()
+    except LookupError:
+        raise RuntimeError(
+            "No request context set. This code path requires an authenticated request."
+        ) from None
+
+
+def get_request_context_or_system() -> RequestContext:
+    """Get the current request context, falling back to SYSTEM_CONTEXT.
+
+    Only use this for code paths that legitimately run outside a
+    request -- e.g. event handlers triggered by the simulator.
+    """
+    try:
+        return _current_context.get()
+    except LookupError:
+        return SYSTEM_CONTEXT
+```
+
+**Why two functions?** A single function that silently falls back to system context is dangerous — a bug in middleware could grant every request admin-level access. The strict version forces developers to think about whether system-context fallback is appropriate for their code path.
+
+### Agent Token Delegation
+
+LLM agents act on behalf of users. The token carries a delegation chain so downstream systems can audit who authorized the agent:
+
+```python
+class AgentTokenRequest(BaseModel):
+    agent_name: str
+    roles: list[str] = ["viewer"]
+
+
+@app.post("/auth/agent-token")
+async def create_agent_token(
+    request: AgentTokenRequest,
+    ctx: RequestContext = require_permission(Permission.FUNDS_MANAGE),
+) -> TokenResponse:
+    """Issue a JWT for an LLM agent.
+
+    Requires funds:manage permission. The agent token is:
+    - Scoped to the caller's fund (not user-specified)
+    - Carries delegated_by = caller's actor ID for audit
+    """
+    token = auth.issue_agent_token(
+        agent_id=str(uuid4()),
+        fund_slug=ctx.fund_slug,
+        roles=request.roles,
+        delegated_by=ctx.actor_id,
+    )
+    ...
+```
+
+Key security decisions:
+- **Agent tokens require authentication** — only authenticated users with `funds:manage` can mint agent tokens
+- **Fund scoping is automatic** — the agent token inherits the caller's fund, preventing cross-fund token creation
+- **Delegation is mandatory** — every agent token carries the creating user's ID
+
 ### Permission Model
 
 ```
-User → has → Role(s) → grants → Permission(s)
+User --> has --> Role(s) --> grants --> Permission(s)
 ```
 
 ```python
@@ -30,113 +142,112 @@ class Role(StrEnum):
 
 
 class Permission(StrEnum):
-    # Positions
+    INSTRUMENTS_READ = "instruments:read"
+    INSTRUMENTS_WRITE = "instruments:write"
+    PRICES_READ = "prices:read"
     POSITIONS_READ = "positions:read"
     POSITIONS_WRITE = "positions:write"
-
-    # Trading
-    TRADES_READ = "trades:read"
     TRADES_EXECUTE = "trades:execute"
-    TRADES_APPROVE = "trades:approve"
-
-    # Risk
-    RISK_READ = "risk:read"
-    RISK_CONFIGURE = "risk:configure"
-
-    # Admin
-    USERS_MANAGE = "users:manage"
-    SYSTEM_CONFIGURE = "system:configure"
+    FUNDS_READ = "funds:read"
+    FUNDS_MANAGE = "funds:manage"
 
 
-ROLE_PERMISSIONS: dict[Role, set[Permission]] = {
-    Role.ADMIN: set(Permission),  # all permissions
-    Role.PORTFOLIO_MANAGER: {
+ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
+    Role.ADMIN: frozenset(Permission),  # all permissions
+    Role.PORTFOLIO_MANAGER: frozenset({
+        Permission.INSTRUMENTS_READ,
+        Permission.PRICES_READ,
         Permission.POSITIONS_READ,
         Permission.POSITIONS_WRITE,
-        Permission.TRADES_READ,
         Permission.TRADES_EXECUTE,
-        Permission.RISK_READ,
-    },
-    Role.ANALYST: {
+        Permission.FUNDS_READ,
+    }),
+    Role.ANALYST: frozenset({
+        Permission.INSTRUMENTS_READ,
+        Permission.PRICES_READ,
         Permission.POSITIONS_READ,
-        Permission.TRADES_READ,
-        Permission.RISK_READ,
-    },
-    Role.RISK_MANAGER: {
+        Permission.FUNDS_READ,
+    }),
+    Role.RISK_MANAGER: frozenset({
+        Permission.INSTRUMENTS_READ,
+        Permission.PRICES_READ,
         Permission.POSITIONS_READ,
-        Permission.RISK_READ,
-        Permission.RISK_CONFIGURE,
-    },
-    Role.COMPLIANCE: {
+        Permission.FUNDS_READ,
+    }),
+    Role.COMPLIANCE: frozenset({
+        Permission.INSTRUMENTS_READ,
+        Permission.PRICES_READ,
         Permission.POSITIONS_READ,
-        Permission.TRADES_READ,
-        Permission.TRADES_APPROVE,
-        Permission.RISK_READ,
-    },
-    Role.VIEWER: {
+        Permission.FUNDS_READ,
+    }),
+    Role.VIEWER: frozenset({
+        Permission.INSTRUMENTS_READ,
+        Permission.PRICES_READ,
         Permission.POSITIONS_READ,
-        Permission.TRADES_READ,
-    },
+        Permission.FUNDS_READ,
+    }),
 }
 ```
 
 ### Permission Checking as a Dependency
 
 ```python
-# shared/auth.py
-
-from functools import wraps
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException
 
 
-def require_permission(*permissions: Permission):
-    """FastAPI dependency that checks permissions."""
-    async def check(user: CurrentUser) -> CurrentUser:
-        user_permissions: set[Permission] = set()
-        for role in user.roles:
-            user_permissions |= ROLE_PERMISSIONS.get(Role(role), set())
+def get_actor_context(request: Request) -> RequestContext:
+    """FastAPI dependency -- returns the authenticated RequestContext.
+    Raises 401 if no user is authenticated.
+    """
+    ctx = get_request_context()
+    if ctx.actor_type == ActorType.SYSTEM:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return ctx
 
-        missing = set(permissions) - user_permissions
+
+def require_permission(*perms: Permission):
+    """FastAPI dependency that checks the caller has all listed permissions."""
+    async def _check(
+        ctx: RequestContext = Depends(get_actor_context),
+    ) -> RequestContext:
+        missing = {p.value for p in perms} - set(ctx.permissions)
         if missing:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Missing permissions: {', '.join(missing)}",
+                status_code=403,
+                detail=f"Missing permissions: {', '.join(sorted(missing))}",
             )
-        return user
-    return Depends(check)
+        return ctx
+    return Depends(_check)
+```
 
+Usage in routes — RBAC and OpenFGA compose naturally as stacked dependencies:
 
-# Usage in routes
-@router.post("/trades")
-async def execute_trade(
-    request: TradeRequest,
-    user: CurrentUser = require_permission(Permission.TRADES_EXECUTE),
-):
-    ...
-
-
-@router.get("/positions/{portfolio_id}")
+```python
+@router.get("/{portfolio_id}/positions")
 async def get_positions(
-    portfolio_id: str,
-    user: CurrentUser = require_permission(Permission.POSITIONS_READ),
-):
+    portfolio_id: UUID,
+    ctx: RequestContext = require_permission(Permission.POSITIONS_READ),
+    _access: None = require_access(Portfolio.relation("can_view")),
+) -> list[Position]:
     ...
 ```
+
+The RBAC dependency runs first (does the actor have the `positions:read` permission?), then the OpenFGA dependency runs (does the actor have `can_view` on this specific portfolio?). Both must pass.
 
 ### Principle of Least Privilege
 
 Default to no access. Every endpoint requires an explicit permission. There is no "authenticated = authorized" assumption.
 
 ```python
-# This is wrong — any authenticated user can access
+# Wrong -- any authenticated user can access
 @router.get("/admin/users")
 async def list_users(user: CurrentUser):
     ...
 
-# This is correct — requires explicit permission
+# Correct -- requires explicit permission
 @router.get("/admin/users")
 async def list_users(
-    user: CurrentUser = require_permission(Permission.USERS_MANAGE),
+    ctx: RequestContext = require_permission(Permission.USERS_MANAGE),
 ):
     ...
 ```
@@ -158,10 +269,12 @@ For these cases, use RBAC for coarse-grained checks and OpenFGA or a policy engi
 | Permission bypass | Endpoint missing permission check | Require explicit auth on all routes, test for missing auth |
 | Role explosion | Too many roles for every combination | Use permission composition, not one role per scenario |
 | Stale roles | User changes role but token has old roles | Short-lived tokens (15 min), or check roles against DB for sensitive ops |
-| Privilege escalation | User modifies their own roles | Roles come from IdP, not user input. Token is signed |
+| Privilege escalation | User modifies their own roles | Roles come from IdP or DB lookup, not user input. Token is signed |
+| Silent admin fallback | Context not set, falls back to system context | Strict `get_request_context()` raises error; explicit opt-in for system fallback |
+| Cross-fund token minting | Unauthenticated agent token creation | Agent tokens require authentication + funds:manage permission |
 
 ## Related Documents
 
 - [Authentication MFA](authentication-mfa.md) — identity verification before authorization
-- [OpenFGA Modeling](../authorization/openfga-modeling.md) — fine-grained relationship-based access
+- [OpenFGA Modeling](../authorization/openfga-modeling.md) — fine-grained relationship-based access and type-safe resource registry
 - [Attribute-Based Access](../authorization/attribute-based-access.md) — dynamic policy evaluation

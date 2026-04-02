@@ -567,7 +567,13 @@ Each module owns its schema exclusively:
 
 ```mermaid
 graph TD
-    subgraph "Authentication"
+    subgraph "Authentication (Phase 0)"
+        JWT[Direct JWT Issuance]
+        APIKEY[API Key Auth]
+        AGENT[Agent Token Delegation]
+    end
+
+    subgraph "Authentication (Target)"
         IDP[Identity Provider - Keycloak]
         MFA[MFA - TOTP / WebAuthn]
     end
@@ -575,6 +581,12 @@ graph TD
     subgraph "Authorization"
         RBAC[RBAC - role-based permissions]
         FGA[OpenFGA - portfolio-level access]
+        REGISTRY[Type-Safe Resource Registry]
+    end
+
+    subgraph "Identity Context"
+        ACTX[Actor Context - contextvars]
+        TYPES[Actor Types: user / apikey / agent / system]
     end
 
     subgraph "Data Security"
@@ -588,18 +600,38 @@ graph TD
         HASH[SHA-256 hash chain]
     end
 
+    JWT --> ACTX
+    APIKEY --> ACTX
+    AGENT --> ACTX
     IDP --> MFA
-    MFA --> RBAC
+    MFA --> ACTX
+    ACTX --> RBAC
     RBAC --> FGA
+    REGISTRY --> FGA
     FGA --> RLS
     AUDIT_LOG --> HASH
 ```
 
+### Current Implementation (Phase 0)
+
+| Layer | Implementation | Status |
+|---|---|---|
+| **Authentication** | Direct JWT issuance (dev-mode `/auth/token`), API key auth (`ApiKey` header / `X-API-Key`), Agent token delegation (`/auth/agent-token` — requires `funds:manage` permission) | Implemented |
+| **Actor context** | `RequestContext` via `contextvars` — carries actor ID, actor type, fund slug, roles, permissions, delegation chain. Strict mode raises on missing context; explicit system fallback for event handlers | Implemented |
+| **Coarse authorization** | RBAC with 6 roles (admin, portfolio_manager, analyst, risk_manager, compliance, viewer) mapped to 8 permissions. `require_permission()` FastAPI dependency | Implemented |
+| **Fine-grained authorization** | OpenFGA with type-safe resource registry. `require_access()` generic dependency. Startup validation against JSON model. Portfolio-level access checks (can_view, can_trade, can_manage) | Implemented |
+| **JWT security** | HS256 signing. Dev secret rejected in non-local environments via Pydantic validator. 60-min expiry | Implemented |
+| **Data isolation** | Application-level via fund_slug in request context. No schema-per-fund or RLS yet | Partial |
+
+### Target State
+
 | Layer | Implementation |
 |---|---|
-| **Authentication** | Keycloak with MFA (TOTP). JWT access tokens (15 min TTL). |
+| **Authentication** | Keycloak with MFA (TOTP). JWT access tokens (15 min TTL). API keys for service accounts with bcrypt/argon2 hashing |
 | **Coarse authorization** | RBAC roles: admin, portfolio_manager, analyst, risk_manager, compliance, viewer |
-| **Fine-grained authorization** | OpenFGA for portfolio-level access: "can user X trade portfolio Y?" |
+| **Fine-grained authorization** | OpenFGA for portfolio-level access with automated tuple management on resource creation |
+| **Data isolation** | Schema-per-fund with RLS as defense-in-depth (see [Tenancy Model](#tenancy-model)) |
+| **Token security** | RS256 signing with key rotation, JTI-based revocation list (Redis-backed), short-lived tokens |
 | **Encryption** | TLS 1.3 for all connections, AES-256 for data at rest, PostgreSQL `pgcrypto` for sensitive fields |
 | **Audit** | Every significant action logged with actor, action, resource, timestamp, and hash chain |
 
