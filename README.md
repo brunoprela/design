@@ -17,6 +17,7 @@ design/
 │   ├── data-access/     SQLAlchemy, Alembic, TimescaleDB, pooling, multi-tenancy
 │   ├── api/             FastAPI, OpenAPI, authentication, authorization, versioning
 │   ├── authorization/   OpenFGA, policy-as-code, ABAC
+│   ├── frontend/        Next.js, OIDC auth, frontend RBAC, API client codegen
 │   ├── messaging/       Kafka topology, schema registry, exactly-once semantics
 │   ├── data-processing/ Ingestion, CDC, ETL/ELT, data quality
 │   ├── ai-ml/           LLM gateway, RAG, embeddings, prompt management
@@ -69,12 +70,18 @@ systems/hedge-fund-desk/risk-engine.md
 
 The patterns and systems in this repo are built around:
 
-- **Python** — primary language
+- **TypeScript** — frontend language
+- **Next.js** — frontend framework (App Router)
+- **Python** — backend language
 - **FastAPI** — API layer
 - **SQLAlchemy + Alembic** — data access and migrations
 - **PostgreSQL** — transactional data
 - **TimescaleDB** — time-series data
 - **Apache Kafka** — event streaming
 - **OpenFGA** — fine-grained authorization
+- **Keycloak** — identity provider (OIDC SSO)
+- **Auth.js** — frontend authentication (next-auth v5)
+- **TanStack Query** — server state management
+- **shadcn/ui** — UI component library
 - **Docker Compose** — local infrastructure
 - **Tach** — module boundary enforcement
